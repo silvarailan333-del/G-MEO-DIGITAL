@@ -1,0 +1,6 @@
+{
+  "name": "Gêmeo Digital — Inteligência Ambiental e Apoio à Decisão",
+  "description": "Plataforma de inteligência estratégica com ambiente de Demonstração (Atlântica Moda) e versão Beta SaaS multiempresa com banco PostgreSQL, autenticação real e cruzamento de dados externos e internos.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

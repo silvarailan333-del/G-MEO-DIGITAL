@@ -1,0 +1,77 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --bg-main: #071A3A;
+  --bg-sidebar: #06132D;
+  --bg-card: #102B50;
+  --bg-card-secondary: #15365F;
+  --border-subtle: rgba(168, 186, 208, 0.16);
+  --accent-cyan: #20C5D5;
+  --text-primary: #F4F8FF;
+  --text-secondary: #A8BAD0;
+  --status-green: #20B981;
+  --status-amber: #F2B84B;
+  --status-red: #EF6464;
+}
+
+.light-theme {
+  --bg-main: #F4F7FB;
+  --bg-sidebar: #06132D;
+  --bg-card: #FFFFFF;
+  --bg-card-secondary: #EEF3F9;
+  --border-subtle: rgba(15, 41, 74, 0.12);
+  --accent-cyan: #0891B2;
+  --text-primary: #0F172A;
+  --text-secondary: #475569;
+  --status-green: #16A34A;
+  --status-amber: #D97706;
+  --status-red: #DC2626;
+}
+
+@layer base {
+  html {
+    font-family: "DM Sans", -apple-system, BlinkMacSystemFont, sans-serif;
+    background-color: var(--bg-main);
+    color: var(--text-primary);
+  }
+
+  body {
+    background-color: var(--bg-main);
+    color: var(--text-primary);
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: "Plus Jakarta Sans", "DM Sans", sans-serif;
+  }
+
+  .font-mono, code, pre {
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Custom subtle scrollbars for deep navy sidebar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(168, 186, 208, 0.2);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(32, 197, 213, 0.4);
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+}

@@ -1,0 +1,203 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net (Default-Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Startup Connectivity Check (zero PII)
+    match /test/connection {
+      allow get: if true;
+      allow list, write: if false;
+    }
+
+    // 3. Global Hardened Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // 4. Validation Blueprints
+    function isValidUserSettings(data) {
+      return data.keys().hasAll(['ownerUid', 'theme', 'defaultRadiusKm', 'preferredTravelMode', 'updatedAt'])
+        && data.keys().hasOnly(['ownerUid', 'theme', 'defaultRadiusKm', 'preferredTravelMode', 'updatedAt'])
+        && data.ownerUid is string
+        && data.ownerUid.size() <= 128
+        && data.ownerUid == request.auth.uid
+        && data.theme in ['dark', 'light']
+        && (data.defaultRadiusKm is int || data.defaultRadiusKm is float)
+        && data.defaultRadiusKm >= 0.5
+        && data.defaultRadiusKm <= 200
+        && data.preferredTravelMode in ['DRIVE', 'WALK', 'TWO_WHEELER']
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidChatSession(data) {
+      return data.keys().hasAll([
+          'ownerUid',
+          'title',
+          'companyId',
+          'companyName',
+          'messageCount',
+          'lastMessagePreview',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerUid',
+          'title',
+          'companyId',
+          'companyName',
+          'messageCount',
+          'lastMessagePreview',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.ownerUid is string
+        && data.ownerUid.size() <= 128
+        && data.ownerUid == request.auth.uid
+        && data.title is string
+        && data.title.size() >= 1
+        && data.title.size() <= 160
+        && data.companyId is int
+        && data.companyId >= 0
+        && data.companyName is string
+        && data.companyName.size() <= 160
+        && data.messageCount is int
+        && data.messageCount >= 0
+        && data.messageCount <= 5000
+        && data.lastMessagePreview is string
+        && data.lastMessagePreview.size() <= 240
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidChatMessage(data) {
+      return data.keys().hasAll([
+          'ownerUid',
+          'role',
+          'content',
+          'toolUsed',
+          'screenContext',
+          'groundingLinks',
+          'sourcesUsed',
+          'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerUid',
+          'role',
+          'content',
+          'toolUsed',
+          'screenContext',
+          'groundingLinks',
+          'sourcesUsed',
+          'createdAt'
+        ])
+        && data.ownerUid is string
+        && data.ownerUid.size() <= 128
+        && data.ownerUid == request.auth.uid
+        && data.role in ['user', 'assistant']
+        && data.content is string
+        && data.content.size() >= 1
+        && data.content.size() <= 20000
+        && data.toolUsed in ['cloudsql', 'maps', 'search', 'general']
+        && data.screenContext is string
+        && data.screenContext.size() <= 160
+        && data.groundingLinks is list
+        && data.groundingLinks.size() <= 10
+        && (data.groundingLinks.size() == 0 || (
+          data.groundingLinks[0] is map
+          && data.groundingLinks[0].keys().hasOnly(['title', 'uri', 'sourceType'])
+          && data.groundingLinks[0].uri is string
+          && data.groundingLinks[0].uri.size() <= 1024
+        ))
+        && data.sourcesUsed is list
+        && data.sourcesUsed.size() <= 12
+        && (data.sourcesUsed.size() == 0 || (
+          data.sourcesUsed[0] is string
+          && data.sourcesUsed[0].size() <= 200
+        ))
+        && data.createdAt is timestamp;
+    }
+
+    function parentChatOwned(userId, chatId) {
+      return exists(/databases/$(database)/documents/users/$(userId)/chats/$(chatId))
+        && get(/databases/$(database)/documents/users/$(userId)/chats/$(chatId)).data.ownerUid == request.auth.uid;
+    }
+
+    // 5. User Settings (ONLY user preferences)
+    match /users/{userId}/settings/{settingId} {
+      allow get: if isOwner(userId) && isValidId(settingId) && settingId == 'preferences';
+      allow list: if isOwner(userId) && existing().ownerUid == request.auth.uid;
+      allow create: if isOwner(userId)
+        && isValidId(settingId)
+        && settingId == 'preferences'
+        && isValidUserSettings(incoming())
+        && incoming().updatedAt == request.time;
+      allow update: if isOwner(userId)
+        && isValidId(settingId)
+        && settingId == 'preferences'
+        && isValidUserSettings(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['theme', 'defaultRadiusKm', 'preferredTravelMode', 'updatedAt']);
+      allow delete: if isOwner(userId) && isValidId(settingId) && settingId == 'preferences';
+    }
+
+    // 6. User Chat Sessions (ONLY chatbot conversation history)
+    match /users/{userId}/chats/{chatId} {
+      allow get: if isOwner(userId) && isValidId(chatId);
+      allow list: if isOwner(userId) && existing().ownerUid == request.auth.uid;
+      allow create: if isOwner(userId)
+        && isValidId(chatId)
+        && isValidChatSession(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isOwner(userId)
+        && isValidId(chatId)
+        && isValidChatSession(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'title',
+          'companyId',
+          'companyName',
+          'messageCount',
+          'lastMessagePreview',
+          'updatedAt'
+        ]);
+      allow delete: if isOwner(userId) && isValidId(chatId);
+
+      // 7. Chat Messages subcollection
+      match /messages/{messageId} {
+        allow get: if isOwner(userId) && isValidId(chatId) && isValidId(messageId);
+        allow list: if isOwner(userId) && existing().ownerUid == request.auth.uid;
+        allow create: if isOwner(userId)
+          && isValidId(chatId)
+          && isValidId(messageId)
+          && isValidChatMessage(incoming())
+          && incoming().createdAt == request.time
+          && parentChatOwned(userId, chatId);
+        allow update: if false;
+        allow delete: if isOwner(userId) && isValidId(chatId) && isValidId(messageId);
+      }
+    }
+  }
+}
