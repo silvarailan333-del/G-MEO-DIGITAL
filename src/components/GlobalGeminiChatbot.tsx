@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import {
   Bot,
+  CheckCircle2,
   Database,
   ExternalLink,
   Globe,
@@ -9,7 +10,9 @@ import {
   Loader2,
   MapPin,
   MessageSquarePlus,
+  Paperclip,
   Send,
+  ShieldAlert,
   Sparkles,
   Trash2,
   X,
@@ -19,6 +22,7 @@ import {
   appendChatMessage,
   createUserChat,
   deleteUserChat,
+  filterChatsByCompany,
   subscribeChatMessages,
   subscribeUserChats,
   type ChatToolUsed,
@@ -26,6 +30,25 @@ import {
   type FirestoreChatSession,
   type GroundingLinkItem,
 } from '../lib/firestoreStore';
+import { safeExternalHref } from '../lib/safeUrl';
+
+interface PendingProposalItem {
+  proposalToken: string;
+  functionName: string;
+  title: string;
+  summary: string;
+  args: Record<string, unknown>;
+  status: string;
+  expiresAt: string;
+  createdAt: string;
+}
+
+interface AttachmentDraft {
+  fileName: string;
+  mimeType: string;
+  base64Data: string;
+  sizeBytes: number;
+}
 
 interface LocalMessage {
   id: string;
@@ -34,6 +57,7 @@ interface LocalMessage {
   toolUsed?: ChatToolUsed;
   groundingLinks?: GroundingLinkItem[];
   sourcesUsed?: string[];
+  toolsInvoked?: string[];
 }
 
 function resolveScreenLabel(pathname: string): string {
@@ -71,8 +95,16 @@ export const GlobalGeminiChatbot: React.FC = () => {
 
   // Firestore state for signed-in user
   const [chats, setChats] = useState<FirestoreChatSession[]>([]);
+  const [filterByActiveCompany, setFilterByActiveCompany] = useState(true);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [firestoreMessages, setFirestoreMessages] = useState<FirestoreChatMessage[]>([]);
+
+  // Multimodal attachment & authorized actions state
+  const [attachment, setAttachment] = useState<AttachmentDraft | null>(null);
+  const [pendingProposals, setPendingProposals] = useState<PendingProposalItem[]>([]);
+  const [resolvingToken, setResolvingToken] = useState<string | null>(null);
+  const [actionFeedback, setActionFeedback] = useState('');
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // In-memory state when signed-out (public/demo/auth screens)
   const [publicMessages, setPublicMessages] = useState<LocalMessage[]>([]);
@@ -83,6 +115,11 @@ export const GlobalGeminiChatbot: React.FC = () => {
     () => companies.find((c) => c.id === activeCompanyId) || companies[0] || null,
     [companies, activeCompanyId]
   );
+
+  const visibleChats = useMemo(() => {
+    if (!filterByActiveCompany || !activeCompany) return chats;
+    return filterChatsByCompany(chats, activeCompany.id);
+  }, [chats, filterByActiveCompany, activeCompany]);
 
   const screenContext = useMemo(() => resolveScreenLabel(location.pathname), [location.pathname]);
 
@@ -99,19 +136,46 @@ export const GlobalGeminiChatbot: React.FC = () => {
       setChats([]);
       setActiveChatId(null);
       setFirestoreMessages([]);
+      setPendingProposals([]);
+      setAttachment(null);
       return;
     }
 
     const unsub = subscribeUserChats(firebaseUser.uid, (nextChats) => {
       setChats(nextChats);
-      setActiveChatId((prev) => {
-        if (prev && nextChats.some((c) => c.id === prev)) return prev;
-        return nextChats.length > 0 ? nextChats[0].id : null;
-      });
     });
 
     return () => unsub();
   }, [firebaseUser]);
+
+  // Keep activeChatId aligned with active company chats when switching companies
+  useEffect(() => {
+    if (!firebaseUser) return;
+    setActiveChatId((prev) => {
+      if (prev && visibleChats.some((c) => c.id === prev)) return prev;
+      return visibleChats.length > 0 ? visibleChats[0].id : null;
+    });
+  }, [firebaseUser, visibleChats, activeCompany?.id]);
+
+  // Load pending proposals for active company when drawer opens
+  useEffect(() => {
+    if (!open || !firebaseUser || !activeCompany?.id) return;
+    let cancelled = false;
+    apiFetch<{ pendingProposals?: PendingProposalItem[] }>(
+      `/api/beta/companies/${activeCompany.id}/ai/status`
+    )
+      .then((res) => {
+        if (!cancelled && Array.isArray(res.pendingProposals)) {
+          setPendingProposals(res.pendingProposals);
+        }
+      })
+      .catch(() => {
+        // non-blocking
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, firebaseUser, activeCompany?.id, apiFetch]);
 
   // Subscribe to active chat messages in Firestore
   useEffect(() => {
@@ -178,13 +242,66 @@ export const GlobalGeminiChatbot: React.FC = () => {
     }
   };
 
+  const handlePickAttachment = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (file.size > 6 * 1024 * 1024) {
+      setFriendlyError('O arquivo anexo excede o limite de 6 MB.');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || '');
+      const base64 = result.includes(',') ? result.split(',')[1] : result;
+      setAttachment({
+        fileName: file.name,
+        mimeType: file.type || 'application/octet-stream',
+        base64Data: base64,
+        sizeBytes: file.size,
+      });
+      setFriendlyError('');
+    };
+    reader.onerror = () => {
+      setFriendlyError('Não foi possível ler o arquivo selecionado.');
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleResolveProposal = async (token: string, action: 'approve' | 'reject') => {
+    if (!activeCompany?.id || resolvingToken) return;
+    setResolvingToken(token);
+    setFriendlyError('');
+    setActionFeedback('');
+    try {
+      const res = await apiFetch<{ ok?: boolean; message?: string }>(
+        `/api/beta/companies/${activeCompany.id}/ai/actions/${encodeURIComponent(token)}/${action}`,
+        { method: 'POST', body: JSON.stringify({}) }
+      );
+      setPendingProposals((prev) => prev.filter((p) => p.proposalToken !== token));
+      setActionFeedback(res.message || (action === 'approve' ? 'Ação autorizada e executada.' : 'Proposta cancelada.'));
+      if (action === 'approve') {
+        window.dispatchEvent(new CustomEvent('gemeo-workspace-updated'));
+      }
+    } catch (err) {
+      setFriendlyError(err instanceof Error ? err.message : 'Não foi possível processar a autorização.');
+    } finally {
+      setResolvingToken(null);
+    }
+  };
+
   const handleSend = async (e?: React.FormEvent, overrideQuestion?: string) => {
     e?.preventDefault();
     const q = (overrideQuestion ?? input).trim();
-    if (!q || loading) return;
+    const currentAttachment = firebaseUser && activeCompany ? attachment : null;
+    if ((!q && !currentAttachment) || loading) return;
+
+    const effectiveQuestion = q || `Analise o arquivo anexo (${currentAttachment?.fileName || 'documento'}).`;
 
     setFriendlyError('');
+    setActionFeedback('');
     if (!overrideQuestion) setInput('');
+    setAttachment(null);
     setLoading(true);
 
     // Build FULL conversation history so Gemini remembers the entire conversation
@@ -200,7 +317,7 @@ export const GlobalGeminiChatbot: React.FC = () => {
 
         if (!chatId) {
           chatId = await createUserChat(firebaseUser.uid, {
-            title: q.slice(0, 80),
+            title: effectiveQuestion.slice(0, 80),
             companyId: activeCompany?.id || 0,
             companyName: activeCompany?.name || '',
           });
@@ -208,14 +325,18 @@ export const GlobalGeminiChatbot: React.FC = () => {
           currentCount = 0;
         }
 
+        const userDisplayMsg = currentAttachment
+          ? `${effectiveQuestion}\n[Anexo: ${currentAttachment.fileName}]`
+          : effectiveQuestion;
+
         // Persist user message to Firestore
         await appendChatMessage(firebaseUser.uid, chatId, {
           role: 'user',
-          content: q,
+          content: userDisplayMsg,
           toolUsed: 'general',
           screenContext,
           currentMessageCount: currentCount,
-          titleIfEmpty: currentCount === 0 ? q.slice(0, 80) : undefined,
+          titleIfEmpty: currentCount === 0 ? effectiveQuestion.slice(0, 80) : undefined,
           companyId: activeCompany?.id || 0,
           companyName: activeCompany?.name || '',
         });
@@ -225,15 +346,32 @@ export const GlobalGeminiChatbot: React.FC = () => {
           toolUsed?: ChatToolUsed;
           groundingLinks?: GroundingLinkItem[];
           sourcesUsed?: string[];
+          toolsInvoked?: string[];
+          pendingProposals?: PendingProposalItem[];
         }>('/api/chat', {
           method: 'POST',
           body: JSON.stringify({
-            question: q,
+            question: effectiveQuestion,
             screenContext,
             companyId: activeCompany?.id || null,
-            history: [...fullHistory, { role: 'user', content: q }],
+            history: [...fullHistory, { role: 'user', content: userDisplayMsg }],
+            attachment: currentAttachment
+              ? {
+                  fileName: currentAttachment.fileName,
+                  mimeType: currentAttachment.mimeType,
+                  base64Data: currentAttachment.base64Data,
+                }
+              : null,
           }),
         });
+
+        if (Array.isArray(res.pendingProposals) && res.pendingProposals.length > 0) {
+          setPendingProposals((prev) => {
+            const map = new Map(prev.map((p) => [p.proposalToken, p]));
+            res.pendingProposals!.forEach((p) => map.set(p.proposalToken, p));
+            return Array.from(map.values());
+          });
+        }
 
         // Persist assistant response to Firestore
         await appendChatMessage(firebaseUser.uid, chatId, {
@@ -250,7 +388,7 @@ export const GlobalGeminiChatbot: React.FC = () => {
       } else {
         const nextHistory: LocalMessage[] = [
           ...publicMessages,
-          { id: `u_${Date.now()}`, role: 'user', content: q },
+          { id: `u_${Date.now()}`, role: 'user', content: effectiveQuestion },
         ];
         setPublicMessages(nextHistory);
 
@@ -258,7 +396,7 @@ export const GlobalGeminiChatbot: React.FC = () => {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            question: q,
+            question: effectiveQuestion,
             screenContext,
             history: nextHistory.map((m) => ({ role: m.role, content: m.content })),
           }),
@@ -365,25 +503,40 @@ export const GlobalGeminiChatbot: React.FC = () => {
             </div>
           </div>
 
-          {/* Firestore Thread Switcher */}
+          {/* Firestore Thread Switcher (per-company isolation + all toggle) */}
           {firebaseUser && showHistoryList && (
-            <div className="border-b border-[var(--border-subtle)] bg-[var(--bg-sidebar)]/90 p-2.5 max-h-44 overflow-y-auto space-y-1.5 text-xs">
-              <div className="flex items-center justify-between text-[10px] font-semibold uppercase tracking-wider text-[var(--text-secondary)] px-1">
-                <span>Suas conversas ({chats.length})</span>
-                <button
-                  type="button"
-                  onClick={() => void handleNewChat()}
-                  className="text-[#20C5D5] hover:underline cursor-pointer"
-                >
-                  + Nova
-                </button>
+            <div className="border-b border-[var(--border-subtle)] bg-[var(--bg-sidebar)]/90 p-2.5 max-h-48 overflow-y-auto space-y-1.5 text-xs">
+              <div className="flex items-center justify-between gap-2 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-secondary)] px-1">
+                <span>
+                  {filterByActiveCompany && activeCompany
+                    ? `Empresa: ${activeCompany.name} (${visibleChats.length})`
+                    : `Todas as conversas (${visibleChats.length})`}
+                </span>
+                <div className="flex items-center gap-2">
+                  {activeCompany && (
+                    <button
+                      type="button"
+                      onClick={() => setFilterByActiveCompany((v) => !v)}
+                      className="text-[10px] text-[var(--text-secondary)] hover:text-[#20C5D5] cursor-pointer"
+                    >
+                      {filterByActiveCompany ? 'Ver todas' : 'Só empresa ativa'}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => void handleNewChat()}
+                    className="text-[#20C5D5] hover:underline cursor-pointer"
+                  >
+                    + Nova
+                  </button>
+                </div>
               </div>
-              {chats.length === 0 ? (
+              {visibleChats.length === 0 ? (
                 <div className="text-[11px] text-[var(--text-secondary)] px-1 py-2">
-                  Nenhuma conversa salva ainda. Envie uma mensagem abaixo.
+                  Nenhuma conversa salva para esta seleção. Envie uma mensagem abaixo.
                 </div>
               ) : (
-                chats.map((c) => (
+                visibleChats.map((c) => (
                   <div
                     key={c.id}
                     className={`flex items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 cursor-pointer transition-colors ${
@@ -402,6 +555,7 @@ export const GlobalGeminiChatbot: React.FC = () => {
                     >
                       <div className="font-medium truncate text-[11px] text-white">{c.title}</div>
                       <div className="text-[10px] truncate opacity-75">
+                        {c.companyName ? `${c.companyName} · ` : ''}
                         {c.messageCount} msg · {c.lastMessagePreview || 'Sem mensagens'}
                       </div>
                     </button>
@@ -491,18 +645,22 @@ export const GlobalGeminiChatbot: React.FC = () => {
                           Fontes verificadas:
                         </div>
                         <div className="flex flex-wrap gap-1.5">
-                          {m.groundingLinks.slice(0, 5).map((link, idx) => (
-                            <a
-                              key={`${link.uri}-${idx}`}
-                              href={link.uri}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="inline-flex items-center gap-1 rounded bg-[var(--bg-sidebar)] border border-[var(--border-subtle)] px-2 py-0.5 text-[10px] text-[#20C5D5] hover:border-[#20C5D5]"
-                            >
-                              <ExternalLink className="h-2.5 w-2.5 shrink-0" />
-                              <span className="truncate max-w-[160px]">{link.title}</span>
-                            </a>
-                          ))}
+                          {m.groundingLinks.slice(0, 5).map((link, idx) => {
+                            const safeHref = safeExternalHref(link.uri);
+                            if (!safeHref) return null;
+                            return (
+                              <a
+                                key={`${safeHref}-${idx}`}
+                                href={safeHref}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-1 rounded bg-[var(--bg-sidebar)] border border-[var(--border-subtle)] px-2 py-0.5 text-[10px] text-[#20C5D5] hover:border-[#20C5D5]"
+                              >
+                                <ExternalLink className="h-2.5 w-2.5 shrink-0" />
+                                <span className="truncate max-w-[160px]">{link.title}</span>
+                              </a>
+                            );
+                          })}
                         </div>
                       </div>
                     )}
@@ -524,6 +682,55 @@ export const GlobalGeminiChatbot: React.FC = () => {
               </div>
             )}
 
+            {pendingProposals.length > 0 && activeCompany && (
+              <div className="space-y-2 pt-1">
+                {pendingProposals.map((prop) => (
+                  <div
+                    key={prop.proposalToken}
+                    className="rounded-xl border border-[#F2B84B]/50 bg-[#F2B84B]/10 p-2.5 space-y-2 text-[11px]"
+                  >
+                    <div className="flex items-start gap-1.5 text-[#F2B84B] font-semibold">
+                      <ShieldAlert className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+                      <span>Autorização necessária: {prop.title}</span>
+                    </div>
+                    <p className="text-[var(--text-primary)] leading-snug">{prop.summary}</p>
+                    <div className="flex items-center gap-2 pt-0.5">
+                      <button
+                        type="button"
+                        disabled={resolvingToken === prop.proposalToken}
+                        onClick={() => void handleResolveProposal(prop.proposalToken, 'approve')}
+                        className="inline-flex items-center gap-1 rounded-md bg-[#20B981] px-2.5 py-1 text-[10px] font-bold text-[#06132D] hover:opacity-90 cursor-pointer disabled:opacity-50"
+                      >
+                        <CheckCircle2 className="h-3 w-3" />
+                        <span>{resolvingToken === prop.proposalToken ? 'Executando...' : 'Autorizar e Executar'}</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={resolvingToken === prop.proposalToken}
+                        onClick={() => void handleResolveProposal(prop.proposalToken, 'reject')}
+                        className="rounded-md border border-[var(--border-subtle)] px-2 py-1 text-[10px] text-[var(--text-secondary)] hover:text-white cursor-pointer disabled:opacity-50"
+                      >
+                        Cancelar
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {actionFeedback && (
+              <div className="rounded-lg border border-[#20B981]/40 bg-[#20B981]/10 px-3 py-2 text-[11px] text-[#20B981] flex items-center justify-between gap-2">
+                <span>{actionFeedback}</span>
+                <button
+                  type="button"
+                  onClick={() => setActionFeedback('')}
+                  className="hover:text-white cursor-pointer shrink-0"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            )}
+
             {friendlyError && (
               <div className="rounded-lg border border-[#EF6464]/40 bg-[#EF6464]/10 px-3 py-2 text-[11px] text-[#EF6464] flex items-start justify-between gap-2">
                 <span>{friendlyError}</span>
@@ -539,25 +746,66 @@ export const GlobalGeminiChatbot: React.FC = () => {
           </div>
 
           <div className="px-3 py-1 bg-[var(--bg-sidebar)] border-t border-[var(--border-subtle)] text-[10px] text-[#F2B84B]">
-            Respostas baseadas apenas em dados reais consultados (Cloud SQL / Maps / Busca).
+            Respostas baseadas em dados reais (Cloud SQL / Maps / Busca) e ações só executam com sua aprovação.
           </div>
+
+          {attachment && (
+            <div className="px-3 py-1.5 bg-[#102B50] border-t border-[var(--border-subtle)] flex items-center justify-between gap-2 text-[11px] text-[#20C5D5]">
+              <span className="truncate">
+                Anexo: {attachment.fileName} ({Math.max(1, Math.round(attachment.sizeBytes / 1024))} KB)
+              </span>
+              <button
+                type="button"
+                onClick={() => setAttachment(null)}
+                className="text-[var(--text-secondary)] hover:text-white cursor-pointer"
+                aria-label="Remover anexo"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
 
           {/* Input Form */}
           <form
             onSubmit={(e) => void handleSend(e)}
-            className="p-2.5 border-t border-[var(--border-subtle)] bg-[var(--bg-card)] flex gap-2"
+            className="p-2.5 border-t border-[var(--border-subtle)] bg-[var(--bg-card)] flex gap-1.5 items-center"
           >
+            {firebaseUser && activeCompany && (
+              <>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".pdf,.xlsx,.xls,.csv,.txt,.png,.jpg,.jpeg,.webp"
+                  onChange={handlePickAttachment}
+                  className="hidden"
+                />
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={loading}
+                  title="Anexar PDF, Excel, CSV ou imagem (máx. 6 MB)"
+                  aria-label="Anexar documento ou planilha"
+                  className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-sidebar)] p-2 text-[var(--text-secondary)] hover:text-[#20C5D5] hover:border-[#20C5D5] cursor-pointer disabled:opacity-50"
+                >
+                  <Paperclip className="h-3.5 w-3.5" />
+                </button>
+              </>
+            )}
             <input
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder="Pergunte sobre empresas, rotas km, mercado..."
+              placeholder={
+                attachment
+                  ? 'O que deseja analisar neste arquivo?'
+                  : 'Pergunte sobre empresas, rotas km, mercado...'
+              }
               disabled={loading}
               className="flex-1 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-sidebar)] px-2.5 py-2 text-xs text-[var(--text-primary)] focus:outline-none focus:border-[#20C5D5]"
             />
             <button
               type="submit"
-              disabled={loading || !input.trim()}
+              disabled={loading || (!input.trim() && !attachment)}
               className="rounded-lg bg-[#20C5D5] px-3 py-2 text-[#06132D] font-semibold hover:bg-[#38d3e2] cursor-pointer disabled:opacity-50"
               aria-label="Enviar mensagem"
             >

@@ -45,6 +45,7 @@ import {
 } from 'lucide-react';
 import { EmptyEvidenceBox, KpiStatCard, PageHeader, StatusBadge } from './ui/TwinUI';
 import { useBetaAuth } from '../beta/AuthContext';
+import { safeExternalHref } from '../lib/safeUrl';
 
 export interface UserCloudSqlCompanyPin {
   id: number;
@@ -1689,9 +1690,9 @@ export const GeoIntelligenceModule: React.FC<{
                                   >
                                     Abrir Dossiê
                                   </button>
-                                  {p.googleMapsUri && (
+                                  {safeExternalHref(p.googleMapsUri) && (
                                     <a
-                                      href={p.googleMapsUri}
+                                      href={safeExternalHref(p.googleMapsUri)}
                                       target="_blank"
                                       rel="noopener noreferrer"
                                       className="rounded border border-slate-300 px-2 py-1 text-[11px] text-slate-700"
@@ -2173,9 +2174,9 @@ export const GeoIntelligenceModule: React.FC<{
                           </td>
                           <td className="py-2.5 pr-3 text-[11px]">
                             <div>{p.priceLevel}</div>
-                            {p.website ? (
+                            {safeExternalHref(p.website) ? (
                               <a
-                                href={p.website}
+                                href={safeExternalHref(p.website)}
                                 target="_blank"
                                 rel="noopener noreferrer"
                                 className="text-[#20C5D5] hover:underline inline-flex items-center gap-1"
@@ -2553,9 +2554,9 @@ export const GeoIntelligenceModule: React.FC<{
                         {e.distanceKm && <span className="text-[#20C5D5]">{e.distanceKm} km</span>}
                         {e.travelTimeText && <span className="text-[#20B981]">{e.travelTimeText}</span>}
                         {e.phone && <span>{e.phone}</span>}
-                        {e.googleMapsUri && (
+                        {safeExternalHref(e.googleMapsUri) && (
                           <a
-                            href={e.googleMapsUri}
+                            href={safeExternalHref(e.googleMapsUri)}
                             target="_blank"
                             rel="noopener noreferrer"
                             className="text-[#20C5D5] hover:underline"
@@ -2781,18 +2782,22 @@ export const GeoIntelligenceModule: React.FC<{
                   <div>{m.content}</div>
                   {m.groundingLinks && m.groundingLinks.length > 0 && (
                     <div className="mt-2 pt-1.5 border-t border-[var(--border-subtle)] flex flex-wrap gap-1.5">
-                      {m.groundingLinks.map((lk, i) => (
-                        <a
-                          key={`${lk.uri}-${i}`}
-                          href={lk.uri}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1 rounded bg-[var(--bg-sidebar)] border border-[var(--border-subtle)] px-2 py-0.5 text-[10px] text-[#20C5D5] hover:border-[#20C5D5]"
-                        >
-                          <ExternalLink className="h-2.5 w-2.5" />
-                          <span>{lk.title}</span>
-                        </a>
-                      ))}
+                      {m.groundingLinks.map((lk, i) => {
+                        const safeHref = safeExternalHref(lk.uri);
+                        if (!safeHref) return null;
+                        return (
+                          <a
+                            key={`${safeHref}-${i}`}
+                            href={safeHref}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 rounded bg-[var(--bg-sidebar)] border border-[var(--border-subtle)] px-2 py-0.5 text-[10px] text-[#20C5D5] hover:border-[#20C5D5]"
+                          >
+                            <ExternalLink className="h-2.5 w-2.5" />
+                            <span>{lk.title}</span>
+                          </a>
+                        );
+                      })}
                     </div>
                   )}
                 </div>
@@ -2990,9 +2995,9 @@ export const GeoIntelligenceModule: React.FC<{
               </div>
               <div>
                 <strong>Site oficial:</strong>{' '}
-                {dossierPlace.website ? (
+                {safeExternalHref(dossierPlace.website) ? (
                   <a
-                    href={dossierPlace.website}
+                    href={safeExternalHref(dossierPlace.website)}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="text-[#20C5D5] hover:underline"
@@ -3058,9 +3063,9 @@ export const GeoIntelligenceModule: React.FC<{
             )}
 
             <div className="flex flex-wrap justify-between gap-2 pt-3 border-t border-[var(--border-subtle)]">
-              {dossierPlace.googleMapsUri ? (
+              {safeExternalHref(dossierPlace.googleMapsUri) ? (
                 <a
-                  href={dossierPlace.googleMapsUri}
+                  href={safeExternalHref(dossierPlace.googleMapsUri)}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs hover:border-[#20C5D5]"

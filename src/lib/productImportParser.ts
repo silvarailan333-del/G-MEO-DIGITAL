@@ -63,6 +63,7 @@ function pickField(normRow: Record<string, unknown>, candidates: string[]): unkn
 function normalizeRowKeys(row: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(row)) {
+    if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
     out[normalizeHeader(k)] = v;
   }
   return out;
@@ -72,9 +73,9 @@ export function parseCatalogSpreadsheet(buffer: ArrayBuffer): {
   items: ParsedCatalogItem[];
   csvPreview: string;
 } {
-  const wb = XLSX.read(buffer, { type: 'array' });
+  const wb = XLSX.read(buffer, { type: 'array', cellHTML: false });
   const sheet = wb.Sheets[wb.SheetNames[0]];
-  const rawRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet);
+  const rawRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet).slice(0, 5000);
   const csvPreview = XLSX.utils.sheet_to_csv(sheet).slice(0, 15000);
 
   const items: ParsedCatalogItem[] = [];
@@ -129,9 +130,9 @@ export function parseSalesUnitsSpreadsheet(buffer: ArrayBuffer): {
   items: ParsedSalesItem[];
   csvPreview: string;
 } {
-  const wb = XLSX.read(buffer, { type: 'array' });
+  const wb = XLSX.read(buffer, { type: 'array', cellHTML: false });
   const sheet = wb.Sheets[wb.SheetNames[0]];
-  const rawRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet);
+  const rawRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet).slice(0, 5000);
   const csvPreview = XLSX.utils.sheet_to_csv(sheet).slice(0, 15000);
 
   const items: ParsedSalesItem[] = [];

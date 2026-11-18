@@ -154,16 +154,25 @@ export async function saveUserPreferences(uid: string, prefs: UserPreferences): 
   }
 }
 
+export function filterChatsByCompany(
+  chats: FirestoreChatSession[],
+  companyId?: number | null
+): FirestoreChatSession[] {
+  if (!companyId || companyId <= 0) return chats;
+  return chats.filter((c) => c.companyId === companyId);
+}
+
 export function subscribeUserChats(
   uid: string,
-  onChange: (chats: FirestoreChatSession[]) => void
+  onChange: (chats: FirestoreChatSession[]) => void,
+  companyId?: number | null
 ): Unsubscribe {
   const path = `users/${uid}/chats`;
   const q = query(
     collection(firestoreDb, 'users', uid, 'chats'),
     where('ownerUid', '==', uid),
     orderBy('updatedAt', 'desc'),
-    limit(25)
+    limit(60)
   );
   return onSnapshot(
     q,
@@ -182,7 +191,7 @@ export function subscribeUserChats(
           updatedAt: data.updatedAt || null,
         };
       });
-      onChange(items);
+      onChange(filterChatsByCompany(items, companyId));
     },
     (error) => {
       handleFirestoreError(error, OperationType.LIST, path);

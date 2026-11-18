@@ -365,3 +365,164 @@ export function downloadSalesUnitsTemplateExcel() {
   XLSX.utils.book_append_sheet(wb, sheet, 'Unidades_Vendidas');
   XLSX.writeFile(wb, 'modelo-unidades-vendidas-gemeo-digital.xlsx');
 }
+
+export interface AiExecutiveReportExportPayload {
+  companyName: string;
+  segment: string;
+  cityState: string;
+  generatedAt: string;
+  executiveSummary: string;
+  sectorContext: string;
+  financialHealth: {
+    statusLabel: string;
+    summary: string;
+    keyNumbers: string[];
+  };
+  competitivePosition: {
+    summary: string;
+    advantages: string[];
+    vulnerabilities: string[];
+  };
+  consumerDiagnosis: {
+    summary: string;
+    strengths: string[];
+    painPoints: string[];
+  };
+  opportunities: Array<{ title: string; impact: string; action: string }>;
+  risks: Array<{ title: string; severity: string; mitigation: string }>;
+  strategicRecommendations: Array<{
+    priority: string;
+    title: string;
+    rationale: string;
+    suggestedKpi: string;
+  }>;
+  dataGaps: string[];
+  groundingLinks?: Array<{ title: string; uri: string }>;
+}
+
+export function exportAiExecutiveReportPDF(report: AiExecutiveReportExportPayload) {
+  const doc = new jsPDF({ unit: 'pt', format: 'a4' });
+  let y = 48;
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const margin = 42;
+  const maxW = pageWidth - margin * 2;
+
+  const ensureSpace = (needed = 40) => {
+    if (y + needed > 780) {
+      doc.addPage();
+      y = 48;
+    }
+  };
+
+  doc.setFillColor(11, 25, 44);
+  doc.rect(0, 0, pageWidth, 88, 'F');
+  doc.setTextColor(255, 255, 255);
+  doc.setFontSize(16);
+  doc.text('GÊMEO DIGITAL AI — DIAGNÓSTICO EXECUTIVO', margin, 36);
+  doc.setFontSize(10);
+  doc.setTextColor(103, 232, 249);
+  doc.text(
+    `${report.companyName} | ${report.segment} | ${report.cityState}`,
+    margin,
+    56
+  );
+  doc.setFontSize(9);
+  doc.setTextColor(203, 213, 225);
+  doc.text(`Gerado em: ${new Date(report.generatedAt).toLocaleString('pt-BR')}`, margin, 72);
+
+  y = 112;
+
+  const addSection = (title: string) => {
+    ensureSpace(36);
+    doc.setFontSize(12);
+    doc.setTextColor(15, 41, 74);
+    doc.text(title, margin, y);
+    y += 7;
+    doc.setDrawColor(203, 213, 225);
+    doc.line(margin, y, pageWidth - margin, y);
+    y += 15;
+    doc.setTextColor(51, 65, 85);
+    doc.setFontSize(10);
+  };
+
+  const addParagraph = (text: string) => {
+    if (!text) return;
+    ensureSpace(24);
+    const lines = doc.splitTextToSize(text, maxW);
+    doc.text(lines, margin, y);
+    y += lines.length * 14 + 6;
+  };
+
+  const addBullets = (items: string[]) => {
+    for (const item of items) {
+      if (!item) continue;
+      ensureSpace(22);
+      const lines = doc.splitTextToSize(`• ${item}`, maxW);
+      doc.text(lines, margin, y);
+      y += lines.length * 14 + 4;
+    }
+  };
+
+  addSection('1. Resumo Executivo & Contexto Setorial');
+  addParagraph(report.executiveSummary);
+  if (report.sectorContext) addParagraph(report.sectorContext);
+
+  addSection(`2. Saúde Financeira (${report.financialHealth.statusLabel})`);
+  addParagraph(report.financialHealth.summary);
+  if (report.financialHealth.keyNumbers.length) {
+    addBullets(report.financialHealth.keyNumbers);
+  }
+
+  addSection('3. Posição Competitiva');
+  addParagraph(report.competitivePosition.summary);
+  if (report.competitivePosition.advantages.length) {
+    addBullets(report.competitivePosition.advantages.map((a) => `Vantagem: ${a}`));
+  }
+  if (report.competitivePosition.vulnerabilities.length) {
+    addBullets(report.competitivePosition.vulnerabilities.map((v) => `Vulnerabilidade: ${v}`));
+  }
+
+  addSection('4. Diagnóstico dos Consumidores');
+  addParagraph(report.consumerDiagnosis.summary);
+  if (report.consumerDiagnosis.strengths.length) {
+    addBullets(report.consumerDiagnosis.strengths.map((s) => `Elogio recorrente: ${s}`));
+  }
+  if (report.consumerDiagnosis.painPoints.length) {
+    addBullets(report.consumerDiagnosis.painPoints.map((p) => `Ponto de dor: ${p}`));
+  }
+
+  addSection('5. Oportunidades e Riscos Estratégicos');
+  if (report.opportunities.length) {
+    addBullets(
+      report.opportunities.map((o) => `[OPORTUNIDADE - ${o.impact}] ${o.title}: ${o.action}`)
+    );
+  }
+  if (report.risks.length) {
+    addBullets(report.risks.map((r) => `[RISCO - ${r.severity}] ${r.title}: ${r.mitigation}`));
+  }
+
+  addSection('6. Recomendações Estratégicas Prioritárias');
+  if (report.strategicRecommendations.length) {
+    addBullets(
+      report.strategicRecommendations.map(
+        (rec) => `[${rec.priority.toUpperCase()}] ${rec.title} — ${rec.rationale} (KPI: ${rec.suggestedKpi})`
+      )
+    );
+  } else {
+    addParagraph('Sem recomendações adicionais geradas.');
+  }
+
+  if (report.dataGaps.length) {
+    addSection('7. Lacunas de Dados Identificadas');
+    addBullets(report.dataGaps);
+  }
+
+  if (report.groundingLinks && report.groundingLinks.length) {
+    addSection('8. Fontes Externas Consultadas');
+    addBullets(report.groundingLinks.map((l) => `${l.title}: ${l.uri}`));
+  }
+
+  const slug = report.companyName.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  doc.save(`diagnostico-gemeo-digital-ai-${slug}.pdf`);
+}
+

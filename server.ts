@@ -34,6 +34,13 @@ import {
   subscriptions,
 } from './src/db/schema.ts';
 import { requireAuth, type AuthRequest } from './src/middleware/auth.ts';
+import {
+  createApiRateLimiter,
+  csrfAndOriginMiddleware,
+  extractClientSecurityContext,
+  httpsAndSecurityHeadersMiddleware,
+  wafAndBotProtectionMiddleware,
+} from './src/middleware/security.ts';
 import { getUserCompanyAccess, recordAuditLog } from './src/middleware/tenant.ts';
 import {
   ANNUAL_DISCOUNT_LABEL,
@@ -65,6 +72,14 @@ import {
   reviewActionPlansProgress,
 } from './src/server/aiService.ts';
 import {
+  classifyAiErrorForUser,
+  generateExecutiveAiReport,
+  getCompanyAiStatus,
+  resolveAiActionProposal,
+  runGemeoDigitalAiChat,
+  type GemeoChatAttachmentInput,
+} from './src/server/gemeoDigitalAi.ts';
+import {
   analyzeTerritorialEnvironment,
   assertCompanyGeoRateLimit,
   computeRouteMatrixServer,
@@ -88,34 +103,70 @@ import {
   formatPct,
   parseFinancialWorkbookBuffer,
 } from './src/lib/financialFormulas.ts';
+import {
+  exportCompanyVerifiedBackup,
+  startPeriodicBackups,
+} from './src/server/backupService.ts';
+import { recordSecurityEvent } from './src/server/securityLogger.ts';
+import {
+  inspectDocumentOrImageUpload,
+  inspectImageUpload,
+  sanitizeUploadFileName,
+  verifyImageBufferSignature,
+} from './src/server/uploadSecurity.ts';
+import {
+  parsePositiveIntParam,
+  sanitizeCnpj,
+  sanitizeEmail,
+  sanitizeErrorForClient,
+  sanitizeHttpUrl,
+  sanitizePlainText,
+} from './src/server/validation.ts';
 
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const EPHEMERAL_RUNTIME_SECRET = crypto.randomBytes(32).toString('hex');
 const ASSET_SIGNING_SECRET =
+  process.env.ASSET_SIGNING_SECRET ||
   process.env.SESSION_SECRET ||
-  process.env.SQL_PASSWORD ||
-  'gemeo-digital-asset-hmac-key';
+  (process.env.SQL_PASSWORD
+    ? crypto.createHash('sha256').update(`asset-hmac:${process.env.SQL_PASSWORD}`).digest('hex')
+    : EPHEMERAL_RUNTIME_SECRET);
 
-function formatFriendlyAiError(error: unknown, fallbackMessage: string): { status: number; message: string } {
+function formatFriendlyAiError(error: unknown, fallbackMessage: string): { status: number; message: string; code?: string } {
   const raw = error instanceof Error ? error.message : String(error || '');
+  if (raw.startsWith('DAILY_COMPANY_AI_QUOTA_REACHED:')) {
+    const [, used, limit] = raw.split(':');
+    return {
+      status: 429,
+      code: 'COMPANY_DAILY_QUOTA',
+      message: `Limite diário de ${limit || ''} consultas de IA para esta empresa atingido (${used || ''}/${limit || ''}). O restante da plataforma continua operando normalmente.`,
+    };
+  }
   const lower = raw.toLowerCase();
   if (lower.includes('429') || lower.includes('resource_exhausted') || lower.includes('quota') || lower.includes('rate-limit')) {
     return {
       status: 429,
+      code: 'QUOTA_EXCEEDED',
       message: 'O limite temporário de consultas da IA foi atingido no momento. Aguarde alguns instantes e tente novamente.',
     };
   }
-  if (lower.includes('gemini_api_key') || lower.includes('api key')) {
+  if (raw === 'GEMINI_API_KEY_NOT_CONFIGURED' || lower.includes('gemini_api_key') || lower.includes('api key')) {
     return {
       status: 503,
-      message: 'Serviço de inteligência temporariamente indisponível por configuração no servidor.',
+      code: 'AI_UNAVAILABLE',
+      message: 'Serviço Gêmeo Digital AI temporariamente indisponível por configuração no servidor. Todas as demais funções da plataforma seguem ativas.',
     };
   }
+  const classified = classifyAiErrorForUser(error);
+  if (classified.status === 503) {
+    return classified;
+  }
   if (raw && !raw.trim().startsWith('{') && raw.length < 180) {
-    return { status: 500, message: raw };
+    return { status: 400, message: raw };
   }
   return { status: 500, message: fallbackMessage };
 }
@@ -153,7 +204,92 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
+  // Hardening Express & Reverse Proxy / Cloudflare awareness
+  app.disable('x-powered-by');
+  app.set('trust proxy', 1);
+
+  // 1. HTTPS redirect, HSTS, CSP & OWASP security headers
+  app.use(httpsAndSecurityHeadersMiddleware);
+
+  // 2. Bounded JSON & URL-encoded body parsing + safe malformed JSON handling
   app.use(express.json({ limit: '10mb' }));
+  app.use(express.urlencoded({ extended: false, limit: '1mb' }));
+  app.use(
+    (
+      err: unknown,
+      _req: express.Request,
+      res: express.Response,
+      next: express.NextFunction
+    ) => {
+      if (err instanceof SyntaxError && 'status' in err) {
+        return res.status(400).json({ error: 'Payload JSON inválido.' });
+      }
+      next(err);
+    }
+  );
+
+  // 3. Application WAF, Anti-Bot, SQLi/XSS/SSRF/Traversal shield & Prototype Pollution stripping
+  app.use(wafAndBotProtectionMiddleware);
+
+  // 4. CSRF / Origin verification on state-changing API routes
+  app.use(csrfAndOriginMiddleware);
+
+  // 5. Tiered DDoS & API Rate Limiting
+  const globalDdosLimiter = createApiRateLimiter({
+    name: 'global_burst',
+    windowMs: 60 * 1000,
+    maxRequests: 240,
+  });
+  const publicDataLimiter = createApiRateLimiter({
+    name: 'public_data',
+    windowMs: 60 * 1000,
+    maxRequests: 40,
+  });
+  const publicAiLimiter = createApiRateLimiter({
+    name: 'public_ai',
+    windowMs: 60 * 1000,
+    maxRequests: 20,
+  });
+  const betaApiLimiter = createApiRateLimiter({
+    name: 'beta_api',
+    windowMs: 60 * 1000,
+    maxRequests: 120,
+    keyByUser: true,
+  });
+  const aiHeavyLimiter = createApiRateLimiter({
+    name: 'ai_heavy',
+    windowMs: 60 * 1000,
+    maxRequests: 30,
+    keyByUser: true,
+  });
+  const uploadLimiter = createApiRateLimiter({
+    name: 'upload_ops',
+    windowMs: 60 * 1000,
+    maxRequests: 15,
+    keyByUser: true,
+  });
+
+  app.use(globalDdosLimiter);
+  app.use('/api/beta', betaApiLimiter);
+
+  // Strict positive-integer validation on all numeric route parameters
+  for (const paramName of [
+    'companyId',
+    'productId',
+    'categoryId',
+    'competitorId',
+    'entityId',
+    'rowId',
+    'itemId',
+    'assetId',
+  ]) {
+    app.param(paramName, (_req, res, next, val) => {
+      if (parsePositiveIntParam(val) === null) {
+        return res.status(400).json({ error: 'Identificador numérico inválido.' });
+      }
+      next();
+    });
+  }
 
   const runCompetitorDiscoveryForCompany = async (
     company: typeof companies.$inferSelect,
@@ -1001,7 +1137,7 @@ async function startServer() {
     res.json({ status: 'ok', service: 'gemeo-digital' });
   });
 
-  app.get('/api/public/plans', (_req, res) => {
+  app.get('/api/public/plans', publicDataLimiter, (_req, res) => {
     res.json({
       plans: Object.values(PLANS_CONFIG),
       addons: PLAN_ADDONS,
@@ -1010,30 +1146,36 @@ async function startServer() {
     });
   });
 
-  app.get('/api/public/macro-indicators', async (req, res) => {
+  app.get('/api/public/macro-indicators', publicDataLimiter, async (req, res) => {
     try {
-      const uf = typeof req.query.uf === 'string' ? req.query.uf : undefined;
+      const ufRaw = typeof req.query.uf === 'string' ? req.query.uf.trim().toUpperCase() : undefined;
+      const uf = ufRaw && /^[A-Z]{2}$/.test(ufRaw) ? ufRaw : undefined;
       const payload = await getOfficialMacroBundle(uf);
       res.json(payload);
     } catch (error) {
-      console.error('Macro indicators error:', error);
+      console.error('Macro indicators error:', error instanceof Error ? error.message : 'error');
       res.status(500).json({ error: 'Falha ao consultar indicadores oficiais.' });
     }
   });
 
-  app.get('/api/public/cnpj/:cnpj', async (req, res) => {
+  app.get('/api/public/cnpj/:cnpj', publicDataLimiter, async (req, res) => {
     try {
-      const data = await lookupCnpjPublic(req.params.cnpj);
+      const cleanCnpj = sanitizeCnpj(req.params.cnpj);
+      if (cleanCnpj.length !== 14) {
+        return res.status(400).json({ error: 'CNPJ deve conter 14 dígitos numéricos.' });
+      }
+      const data = await lookupCnpjPublic(cleanCnpj);
       res.json(data);
     } catch (error: unknown) {
-      const message =
-        error instanceof Error ? error.message : 'Erro ao consultar CNPJ.';
-      res.status(400).json({ error: message });
+      res.status(400).json({
+        error: sanitizeErrorForClient(error, 'Erro ao consultar CNPJ.'),
+      });
     }
   });
 
-  app.post('/api/public/demo/products/extract-import', async (req, res) => {
+  app.post('/api/public/demo/products/extract-import', publicAiLimiter, uploadLimiter, async (req, res) => {
     try {
+      const ctx = extractClientSecurityContext(req);
       const { mode, fileName, mimeType, base64Data, textContent } = req.body as {
         mode: 'catalog' | 'sales';
         fileName: string;
@@ -1044,42 +1186,63 @@ async function startServer() {
       if (mode !== 'catalog' && mode !== 'sales') {
         return res.status(400).json({ error: 'Modo inválido.' });
       }
-      const extracted = await extractProductCatalogOrSalesFromContent({
-        mode,
+      const checked = inspectDocumentOrImageUpload({
         fileName: fileName || 'arquivo',
         mimeType: mimeType || 'application/octet-stream',
         base64Data,
-        textContent,
+      });
+      if (!checked.ok) {
+        void recordSecurityEvent({
+          eventType: 'UPLOAD_REJECTED',
+          severity: 'medium',
+          ip: ctx.ip,
+          method: req.method,
+          path: req.path,
+          cfRay: ctx.cfRay,
+          cfCountry: ctx.cfCountry,
+          userAgent: ctx.userAgent,
+          details: { reason: checked.error, fileName: checked.safeFileName },
+        });
+        return res.status(400).json({ error: checked.error });
+      }
+
+      const extracted = await extractProductCatalogOrSalesFromContent({
+        mode,
+        fileName: checked.safeFileName,
+        mimeType: checked.detectedMimeType || mimeType || 'application/octet-stream',
+        base64Data,
+        textContent: typeof textContent === 'string' ? textContent.slice(0, 60000) : undefined,
       });
       res.json(extracted);
     } catch (error: unknown) {
-      console.error('Demo extract product import error:', error);
+      console.error('Demo extract product import error:', error instanceof Error ? error.message : 'error');
       res.status(500).json({
-        error: error instanceof Error ? error.message : 'Erro ao interpretar arquivo na demonstração.',
+        error: sanitizeErrorForClient(error, 'Erro ao interpretar arquivo na demonstração.'),
       });
     }
   });
 
   // Public Gemini Chatbot (zero Cloud SQL user data access; supports Maps & Search Grounding + full history)
-  app.post('/api/public/chat', async (req, res) => {
+  app.post('/api/public/chat', publicAiLimiter, async (req, res) => {
     try {
       const { question, screenContext, history } = req.body as {
         question?: string;
         screenContext?: string;
         history?: Array<{ role: 'user' | 'assistant'; content: string }>;
       };
-      if (!question || !question.trim()) {
+      const cleanQuestion = sanitizePlainText(question, 2500);
+      if (!cleanQuestion) {
         return res.status(400).json({ error: 'Pergunta é obrigatória.' });
       }
       const result = await askGroundedChatbot({
-        question: question.trim(),
-        screenContext: screenContext || 'Página Pública / Demonstração',
-        history: Array.isArray(history) ? history : [],
+        question: cleanQuestion,
+        screenContext: sanitizePlainText(screenContext, 160) || 'Página Pública / Demonstração',
+        history: Array.isArray(history) ? history.slice(-40) : [],
         isAuthenticated: false,
       });
       res.json(result);
     } catch (error: unknown) {
-      console.error('Public chat error:', error);
+      console.error('Public chat error:', error instanceof Error ? error.message : 'error');
       const friendly = formatFriendlyAiError(
         error,
         'Não foi possível consultar o chatbot no momento. Tente novamente em instantes.'
@@ -1093,10 +1256,10 @@ async function startServer() {
   // =========================================================================
   app.get('/api/beta/assets/:assetId', async (req, res) => {
     try {
-      const assetId = Number(req.params.assetId);
-      const cid = Number(req.query.cid);
+      const assetId = parsePositiveIntParam(req.params.assetId);
+      const cid = parsePositiveIntParam(req.query.cid);
       const sig = String(req.query.sig || '');
-      if (!Number.isInteger(assetId) || !Number.isInteger(cid) || !verifyAssetSignature(assetId, cid, sig)) {
+      if (!assetId || !cid || !verifyAssetSignature(assetId, cid, sig)) {
         return res.status(403).json({ error: 'Acesso negado ao arquivo.' });
       }
       const [asset] = await db
@@ -1107,11 +1270,19 @@ async function startServer() {
         return res.status(404).json({ error: 'Arquivo não encontrado.' });
       }
       const buffer = Buffer.from(asset.dataBase64, 'base64');
+      if (!verifyImageBufferSignature(buffer, asset.mimeType)) {
+        return res.status(403).json({ error: 'Assinatura do arquivo inválida.' });
+      }
+      const safeDownloadName = sanitizeUploadFileName(asset.fileName, 'asset');
       res.setHeader('Content-Type', asset.mimeType);
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
+      res.setHeader('Cross-Origin-Resource-Policy', 'same-site');
+      res.setHeader('Content-Disposition', `inline; filename="${safeDownloadName}"`);
       res.setHeader('Cache-Control', 'private, max-age=86400');
       res.send(buffer);
     } catch (error) {
-      console.error('Asset fetch error:', error);
+      console.error('Asset fetch error:', error instanceof Error ? error.message : 'error');
       res.status(500).json({ error: 'Erro ao carregar arquivo.' });
     }
   });
@@ -1131,7 +1302,7 @@ async function startServer() {
       const memberships = await db
         .select()
         .from(companyMembers)
-        .where(eq(companyMembers.userId, dbUser.id));
+        .where(and(eq(companyMembers.userId, dbUser.id), eq(companyMembers.status, 'active')));
 
       const memberCompanyIds = memberships
         .map((m) => m.companyId)
@@ -1148,7 +1319,7 @@ async function startServer() {
         companies: [...owned, ...sharedCompanies],
       });
     } catch (error) {
-      console.error('GET /api/beta/me error:', error);
+      console.error('GET /api/beta/me error:', error instanceof Error ? error.message : 'error');
       res.status(500).json({ error: 'Erro ao carregar perfil e empresas.' });
     }
   });
@@ -1157,7 +1328,7 @@ async function startServer() {
     try {
       const dbUser = req.dbUser!;
       const body = req.body as Record<string, unknown>;
-      const name = String(body.name || '').trim();
+      const name = sanitizePlainText(body.name, 160);
       if (!name) {
         return res.status(400).json({ error: 'Nome da empresa é obrigatório.' });
       }
@@ -1167,22 +1338,24 @@ async function startServer() {
         .values({
           ownerUserId: dbUser.id,
           name,
-          legalName: String(body.legalName || ''),
-          tradeName: String(body.tradeName || name),
-          cnpj: String(body.cnpj || '').replace(/\D/g, ''),
-          cnae: String(body.cnae || ''),
-          segment: String(body.segment || ''),
-          companySize: String(body.companySize || ''),
-          registrationStatus: String(body.registrationStatus || ''),
-          description: String(body.description || ''),
-          operationType: String(body.operationType || 'both'),
-          address: String(body.address || ''),
-          city: String(body.city || ''),
-          state: String(body.state || ''),
-          phone: String(body.phone || ''),
-          commercialEmail: String(body.commercialEmail || dbUser.email),
-          website: String(body.website || ''),
-          logoUrl: String(body.logoUrl || ''),
+          legalName: sanitizePlainText(body.legalName, 200),
+          tradeName: sanitizePlainText(body.tradeName, 200) || name,
+          cnpj: sanitizeCnpj(body.cnpj),
+          cnae: sanitizePlainText(body.cnae, 80),
+          segment: sanitizePlainText(body.segment, 120),
+          companySize: sanitizePlainText(body.companySize, 80),
+          registrationStatus: sanitizePlainText(body.registrationStatus, 80),
+          description: sanitizePlainText(body.description, 2500),
+          operationType: ['physical', 'ecommerce', 'both'].includes(String(body.operationType))
+            ? String(body.operationType)
+            : 'both',
+          address: sanitizePlainText(body.address, 260),
+          city: sanitizePlainText(body.city, 120),
+          state: sanitizePlainText(body.state, 4).toUpperCase(),
+          phone: sanitizePlainText(body.phone, 40),
+          commercialEmail: sanitizeEmail(body.commercialEmail) || dbUser.email,
+          website: sanitizeHttpUrl(body.website),
+          logoUrl: sanitizeHttpUrl(body.logoUrl, { allowRelativeAsset: true }),
         })
         .returning();
 
@@ -1328,11 +1501,14 @@ async function startServer() {
   });
 
   // Upload asset (logo or product image) scoped strictly to company
-  app.post('/api/beta/companies/:companyId/assets', requireAuth, async (req: AuthRequest, res) => {
+  app.post('/api/beta/companies/:companyId/assets', requireAuth, uploadLimiter, async (req: AuthRequest, res) => {
     try {
+      const ctx = extractClientSecurityContext(req);
       const companyId = Number(req.params.companyId);
       const access = await getUserCompanyAccess(req.dbUser!.id, companyId);
-      if (!access) return res.status(403).json({ error: 'Acesso negado a esta empresa.' });
+      if (!access || access.role === 'viewer') {
+        return res.status(403).json({ error: 'Acesso negado a esta empresa.' });
+      }
 
       const { fileName, mimeType, dataBase64 } = req.body as {
         fileName?: string;
@@ -1342,13 +1518,26 @@ async function startServer() {
       if (!fileName || !mimeType || !dataBase64) {
         return res.status(400).json({ error: 'Arquivo inválido.' });
       }
-      if (!['image/png', 'image/jpeg', 'image/webp'].includes(mimeType)) {
-        return res.status(400).json({ error: 'Formato permitido: PNG, JPEG ou WEBP.' });
-      }
-      const cleanBase64 = dataBase64.includes(',') ? dataBase64.split(',')[1] : dataBase64;
-      const sizeBytes = Buffer.byteLength(cleanBase64, 'base64');
-      if (sizeBytes > 2.5 * 1024 * 1024) {
-        return res.status(400).json({ error: 'Imagem excede o limite de 2,5 MB.' });
+      const checked = inspectImageUpload({
+        fileName,
+        mimeType,
+        dataBase64,
+      });
+      if (!checked.ok) {
+        void recordSecurityEvent({
+          eventType: 'UPLOAD_REJECTED',
+          severity: 'medium',
+          ip: ctx.ip,
+          method: req.method,
+          path: req.path,
+          userId: req.dbUser!.id,
+          companyId,
+          cfRay: ctx.cfRay,
+          cfCountry: ctx.cfCountry,
+          userAgent: ctx.userAgent,
+          details: { reason: checked.error, fileName: checked.safeFileName },
+        });
+        return res.status(400).json({ error: checked.error });
       }
 
       const [asset] = await db
@@ -1356,17 +1545,17 @@ async function startServer() {
         .values({
           companyId,
           uploadedByUserId: req.dbUser!.id,
-          fileName: fileName.slice(0, 120),
-          mimeType,
-          sizeBytes,
-          dataBase64: cleanBase64,
+          fileName: checked.safeFileName,
+          mimeType: checked.detectedMimeType,
+          sizeBytes: checked.sizeBytes,
+          dataBase64: checked.buffer.toString('base64'),
         })
         .returning();
 
       const url = signAssetUrl(asset.id, companyId);
       res.status(201).json({ id: asset.id, url });
     } catch (error) {
-      console.error('POST asset error:', error);
+      console.error('POST asset error:', error instanceof Error ? error.message : 'error');
       res.status(500).json({ error: 'Erro ao enviar imagem.' });
     }
   });
@@ -1470,23 +1659,32 @@ async function startServer() {
       const [updated] = await db
         .update(companies)
         .set({
-          name: b.name !== undefined ? String(b.name) : access.company.name,
-          legalName: b.legalName !== undefined ? String(b.legalName) : access.company.legalName,
-          tradeName: b.tradeName !== undefined ? String(b.tradeName) : access.company.tradeName,
-          cnpj: b.cnpj !== undefined ? String(b.cnpj).replace(/\D/g, '') : access.company.cnpj,
-          cnae: b.cnae !== undefined ? String(b.cnae) : access.company.cnae,
-          segment: b.segment !== undefined ? String(b.segment) : access.company.segment,
-          companySize: b.companySize !== undefined ? String(b.companySize) : access.company.companySize,
-          registrationStatus: b.registrationStatus !== undefined ? String(b.registrationStatus) : access.company.registrationStatus,
-          description: b.description !== undefined ? String(b.description) : access.company.description,
-          operationType: b.operationType !== undefined ? String(b.operationType) : access.company.operationType,
-          address: b.address !== undefined ? String(b.address) : access.company.address,
-          city: b.city !== undefined ? String(b.city) : access.company.city,
-          state: b.state !== undefined ? String(b.state) : access.company.state,
-          phone: b.phone !== undefined ? String(b.phone) : access.company.phone,
-          commercialEmail: b.commercialEmail !== undefined ? String(b.commercialEmail) : access.company.commercialEmail,
-          website: b.website !== undefined ? String(b.website) : access.company.website,
-          logoUrl: b.logoUrl !== undefined ? String(b.logoUrl) : access.company.logoUrl,
+          name: b.name !== undefined ? sanitizePlainText(b.name, 160) || access.company.name : access.company.name,
+          legalName: b.legalName !== undefined ? sanitizePlainText(b.legalName, 200) : access.company.legalName,
+          tradeName: b.tradeName !== undefined ? sanitizePlainText(b.tradeName, 200) : access.company.tradeName,
+          cnpj: b.cnpj !== undefined ? sanitizeCnpj(b.cnpj) : access.company.cnpj,
+          cnae: b.cnae !== undefined ? sanitizePlainText(b.cnae, 80) : access.company.cnae,
+          segment: b.segment !== undefined ? sanitizePlainText(b.segment, 120) : access.company.segment,
+          companySize: b.companySize !== undefined ? sanitizePlainText(b.companySize, 80) : access.company.companySize,
+          registrationStatus: b.registrationStatus !== undefined ? sanitizePlainText(b.registrationStatus, 80) : access.company.registrationStatus,
+          description: b.description !== undefined ? sanitizePlainText(b.description, 2500) : access.company.description,
+          operationType:
+            b.operationType !== undefined && ['physical', 'ecommerce', 'both'].includes(String(b.operationType))
+              ? String(b.operationType)
+              : access.company.operationType,
+          address: b.address !== undefined ? sanitizePlainText(b.address, 260) : access.company.address,
+          city: b.city !== undefined ? sanitizePlainText(b.city, 120) : access.company.city,
+          state: b.state !== undefined ? sanitizePlainText(b.state, 4).toUpperCase() : access.company.state,
+          phone: b.phone !== undefined ? sanitizePlainText(b.phone, 40) : access.company.phone,
+          commercialEmail:
+            b.commercialEmail !== undefined
+              ? sanitizeEmail(b.commercialEmail) || access.company.commercialEmail
+              : access.company.commercialEmail,
+          website: b.website !== undefined ? sanitizeHttpUrl(b.website) : access.company.website,
+          logoUrl:
+            b.logoUrl !== undefined
+              ? sanitizeHttpUrl(b.logoUrl, { allowRelativeAsset: true })
+              : access.company.logoUrl,
           updatedAt: new Date(),
         })
         .where(eq(companies.id, companyId))
@@ -1503,7 +1701,7 @@ async function startServer() {
 
       res.json({ company: updated });
     } catch (error) {
-      console.error('PATCH company error:', error);
+      console.error('PATCH company error:', error instanceof Error ? error.message : 'error');
       res.status(500).json({ error: 'Erro ao atualizar empresa.' });
     }
   });
@@ -1572,23 +1770,39 @@ async function startServer() {
       const access = await getUserCompanyAccess(req.dbUser!.id, companyId);
       if (!access || access.role === 'viewer') return res.status(403).json({ error: 'Sem permissão.' });
       const b = req.body as Record<string, unknown>;
-      const name = String(b.name || '').trim();
+      const name = sanitizePlainText(b.name, 160);
       if (!name) return res.status(400).json({ error: 'Nome do produto é obrigatório.' });
+
+      let safeCategoryId: number | null = null;
+      if (b.categoryId) {
+        const candidateCatId = parsePositiveIntParam(b.categoryId);
+        if (!candidateCatId) {
+          return res.status(400).json({ error: 'Categoria inválida.' });
+        }
+        const [ownedCat] = await db
+          .select({ id: categories.id })
+          .from(categories)
+          .where(and(eq(categories.id, candidateCatId), eq(categories.companyId, companyId)));
+        if (!ownedCat) {
+          return res.status(403).json({ error: 'Categoria não pertence a esta empresa.' });
+        }
+        safeCategoryId = ownedCat.id;
+      }
 
       const [prod] = await db
         .insert(products)
         .values({
           companyId,
-          categoryId: b.categoryId ? Number(b.categoryId) : null,
+          categoryId: safeCategoryId,
           name,
-          description: String(b.description || ''),
-          sku: String(b.sku || ''),
+          description: sanitizePlainText(b.description, 1500),
+          sku: sanitizePlainText(b.sku, 80),
           priceCents: Math.max(0, Math.round(Number(b.priceReais || 0) * 100)),
           acquisitionCostCents: Math.max(0, Math.round(Number(b.costReais || 0) * 100)),
           stockQty: Math.max(0, Math.round(Number(b.stockQty || 0))),
           soldUnits: Math.max(0, Math.round(Number(b.soldUnits || 0))),
-          status: String(b.status || 'active'),
-          imageUrl: String(b.imageUrl || ''),
+          status: ['active', 'draft', 'archived'].includes(String(b.status)) ? String(b.status) : 'active',
+          imageUrl: sanitizeHttpUrl(b.imageUrl, { allowRelativeAsset: true }),
         })
         .returning();
 
@@ -1604,7 +1818,7 @@ async function startServer() {
 
       res.status(201).json({ product: prod });
     } catch (error) {
-      console.error('POST product error:', error);
+      console.error('POST product error:', error instanceof Error ? error.message : 'error');
       res.status(500).json({ error: 'Erro ao cadastrar produto.' });
     }
   });
@@ -1623,19 +1837,43 @@ async function startServer() {
       if (!existing) return res.status(404).json({ error: 'Produto não encontrado.' });
 
       const b = req.body as Record<string, unknown>;
+      let nextCategoryId = existing.categoryId;
+      if (b.categoryId !== undefined) {
+        if (!b.categoryId) {
+          nextCategoryId = null;
+        } else {
+          const candidateCatId = parsePositiveIntParam(b.categoryId);
+          if (!candidateCatId) return res.status(400).json({ error: 'Categoria inválida.' });
+          const [ownedCat] = await db
+            .select({ id: categories.id })
+            .from(categories)
+            .where(and(eq(categories.id, candidateCatId), eq(categories.companyId, companyId)));
+          if (!ownedCat) {
+            return res.status(403).json({ error: 'Categoria não pertence a esta empresa.' });
+          }
+          nextCategoryId = ownedCat.id;
+        }
+      }
+
       const [updated] = await db
         .update(products)
         .set({
-          name: b.name !== undefined ? String(b.name) : existing.name,
-          description: b.description !== undefined ? String(b.description) : existing.description,
-          sku: b.sku !== undefined ? String(b.sku) : existing.sku,
-          categoryId: b.categoryId !== undefined ? (b.categoryId ? Number(b.categoryId) : null) : existing.categoryId,
+          name: b.name !== undefined ? sanitizePlainText(b.name, 160) || existing.name : existing.name,
+          description: b.description !== undefined ? sanitizePlainText(b.description, 1500) : existing.description,
+          sku: b.sku !== undefined ? sanitizePlainText(b.sku, 80) : existing.sku,
+          categoryId: nextCategoryId,
           priceCents: b.priceReais !== undefined ? Math.max(0, Math.round(Number(b.priceReais) * 100)) : existing.priceCents,
           acquisitionCostCents: b.costReais !== undefined ? Math.max(0, Math.round(Number(b.costReais) * 100)) : existing.acquisitionCostCents,
           stockQty: b.stockQty !== undefined ? Math.max(0, Math.round(Number(b.stockQty))) : existing.stockQty,
           soldUnits: b.soldUnits !== undefined ? Math.max(0, Math.round(Number(b.soldUnits))) : existing.soldUnits,
-          status: b.status !== undefined ? String(b.status) : existing.status,
-          imageUrl: b.imageUrl !== undefined ? String(b.imageUrl) : existing.imageUrl,
+          status:
+            b.status !== undefined && ['active', 'draft', 'archived'].includes(String(b.status))
+              ? String(b.status)
+              : existing.status,
+          imageUrl:
+            b.imageUrl !== undefined
+              ? sanitizeHttpUrl(b.imageUrl, { allowRelativeAsset: true })
+              : existing.imageUrl,
           updatedAt: new Date(),
         })
         .where(and(eq(products.id, productId), eq(products.companyId, companyId)))
@@ -1653,7 +1891,7 @@ async function startServer() {
 
       res.json({ product: updated });
     } catch (error) {
-      console.error('PATCH product error:', error);
+      console.error('PATCH product error:', error instanceof Error ? error.message : 'error');
       res.status(500).json({ error: 'Erro ao atualizar produto.' });
     }
   });
@@ -1686,8 +1924,9 @@ async function startServer() {
   });
 
   // Extract Product Catalog / Stock OR Units Sold from Excel/PDF
-  app.post('/api/beta/companies/:companyId/products/extract-import', requireAuth, async (req: AuthRequest, res) => {
+  app.post('/api/beta/companies/:companyId/products/extract-import', requireAuth, uploadLimiter, async (req: AuthRequest, res) => {
     try {
+      const ctx = extractClientSecurityContext(req);
       const companyId = Number(req.params.companyId);
       const access = await getUserCompanyAccess(req.dbUser!.id, companyId);
       if (!access || access.role === 'viewer') return res.status(403).json({ error: 'Sem permissão.' });
@@ -1703,20 +1942,41 @@ async function startServer() {
       if (mode !== 'catalog' && mode !== 'sales') {
         return res.status(400).json({ error: 'Modo de importação inválido (use catalog ou sales).' });
       }
-
-      const extracted = await extractProductCatalogOrSalesFromContent({
-        mode,
+      const checked = inspectDocumentOrImageUpload({
         fileName: fileName || 'arquivo',
         mimeType: mimeType || 'application/octet-stream',
         base64Data,
-        textContent,
+      });
+      if (!checked.ok) {
+        void recordSecurityEvent({
+          eventType: 'UPLOAD_REJECTED',
+          severity: 'medium',
+          ip: ctx.ip,
+          method: req.method,
+          path: req.path,
+          userId: req.dbUser!.id,
+          companyId,
+          cfRay: ctx.cfRay,
+          cfCountry: ctx.cfCountry,
+          userAgent: ctx.userAgent,
+          details: { reason: checked.error, fileName: checked.safeFileName },
+        });
+        return res.status(400).json({ error: checked.error });
+      }
+
+      const extracted = await extractProductCatalogOrSalesFromContent({
+        mode,
+        fileName: checked.safeFileName,
+        mimeType: checked.detectedMimeType || mimeType || 'application/octet-stream',
+        base64Data,
+        textContent: typeof textContent === 'string' ? textContent.slice(0, 60000) : undefined,
       });
 
       res.json(extracted);
     } catch (error: unknown) {
-      console.error('Extract product import error:', error);
+      console.error('Extract product import error:', error instanceof Error ? error.message : 'error');
       res.status(500).json({
-        error: error instanceof Error ? error.message : 'Erro ao interpretar arquivo de produtos/vendas.',
+        error: sanitizeErrorForClient(error, 'Erro ao interpretar arquivo de produtos/vendas.'),
       });
     }
   });
@@ -1963,10 +2223,15 @@ async function startServer() {
         .where(and(eq(integrations.companyId, companyId), eq(integrations.provider, provider)));
       if (!existing) return res.status(404).json({ error: 'Conector não encontrado.' });
 
+      const safeStoreUrl = storeUrl !== undefined ? sanitizeHttpUrl(storeUrl) : existing.storeUrl;
+      if (storeUrl !== undefined && String(storeUrl).trim() && !safeStoreUrl) {
+        return res.status(400).json({ error: 'URL da loja inválida ou não permitida pela política de segurança.' });
+      }
+
       let newStatus = 'disconnected';
       let lastError = '';
       if (provider === 'own_site') {
-        newStatus = storeUrl && storeUrl.trim() ? 'connected' : 'disconnected';
+        newStatus = safeStoreUrl ? 'connected' : 'disconnected';
       } else {
         newStatus = clientId && clientId.trim() ? 'awaiting_credentials' : 'disconnected';
         lastError =
@@ -1976,10 +2241,10 @@ async function startServer() {
       const [updated] = await db
         .update(integrations)
         .set({
-          storeUrl: storeUrl !== undefined ? String(storeUrl) : existing.storeUrl,
+          storeUrl: safeStoreUrl,
           connectionStatus: newStatus,
           lastError,
-          configJson: clientId ? { clientIdHint: clientId.slice(0, 6) + '***' } : existing.configJson,
+          configJson: clientId ? { clientIdHint: sanitizePlainText(clientId, 12).slice(0, 6) + '***' } : existing.configJson,
           updatedAt: new Date(),
         })
         .where(eq(integrations.id, existing.id))
@@ -1997,7 +2262,7 @@ async function startServer() {
 
       res.json({ integration: updated });
     } catch (error) {
-      console.error('PATCH integration error:', error);
+      console.error('PATCH integration error:', error instanceof Error ? error.message : 'error');
       res.status(500).json({ error: 'Erro ao configurar integração.' });
     }
   });
@@ -2007,7 +2272,7 @@ async function startServer() {
       const companyId = Number(req.params.companyId);
       const provider = String(req.params.provider);
       const access = await getUserCompanyAccess(req.dbUser!.id, companyId);
-      if (!access) return res.status(403).json({ error: 'Sem permissão.' });
+      if (!access || access.role === 'viewer') return res.status(403).json({ error: 'Sem permissão.' });
 
       const [existing] = await db
         .select()
@@ -2048,14 +2313,15 @@ async function startServer() {
           'Esta integração oficial ainda não possui token OAuth conectado. Nenhuma importação falsa foi simulada.',
       });
     } catch (error) {
-      console.error('POST sync integration error:', error);
+      console.error('POST sync integration error:', error instanceof Error ? error.message : 'error');
       res.status(500).json({ error: 'Erro ao sincronizar integração.' });
     }
   });
 
   // Data Import Preview (AI/OCR for images/PDFs or structured rows) & Confirm
-  app.post('/api/beta/companies/:companyId/imports/extract', requireAuth, async (req: AuthRequest, res) => {
+  app.post('/api/beta/companies/:companyId/imports/extract', requireAuth, uploadLimiter, async (req: AuthRequest, res) => {
     try {
+      const ctx = extractClientSecurityContext(req);
       const companyId = Number(req.params.companyId);
       const access = await getUserCompanyAccess(req.dbUser!.id, companyId);
       if (!access || access.role === 'viewer') return res.status(403).json({ error: 'Sem permissão.' });
@@ -2067,18 +2333,40 @@ async function startServer() {
         textContent?: string;
       };
 
-      const extracted = await extractStructuredDataFromContent({
-        fileName,
-        mimeType,
+      const checked = inspectDocumentOrImageUpload({
+        fileName: fileName || 'arquivo',
+        mimeType: mimeType || 'application/octet-stream',
         base64Data,
-        textContent,
+      });
+      if (!checked.ok) {
+        void recordSecurityEvent({
+          eventType: 'UPLOAD_REJECTED',
+          severity: 'medium',
+          ip: ctx.ip,
+          method: req.method,
+          path: req.path,
+          userId: req.dbUser!.id,
+          companyId,
+          cfRay: ctx.cfRay,
+          cfCountry: ctx.cfCountry,
+          userAgent: ctx.userAgent,
+          details: { reason: checked.error, fileName: checked.safeFileName },
+        });
+        return res.status(400).json({ error: checked.error });
+      }
+
+      const extracted = await extractStructuredDataFromContent({
+        fileName: checked.safeFileName,
+        mimeType: checked.detectedMimeType || mimeType,
+        base64Data,
+        textContent: typeof textContent === 'string' ? textContent.slice(0, 60000) : undefined,
       });
 
       res.json(extracted);
     } catch (error: unknown) {
-      console.error('Extract import error:', error);
+      console.error('Extract import error:', error instanceof Error ? error.message : 'error');
       res.status(500).json({
-        error: error instanceof Error ? error.message : 'Erro ao extrair prévia do arquivo.',
+        error: sanitizeErrorForClient(error, 'Erro ao extrair prévia do arquivo.'),
       });
     }
   });
@@ -2201,14 +2489,14 @@ async function startServer() {
         .insert(internalMetrics)
         .values({
           companyId,
-          periodDate: String(b.periodDate || new Date().toISOString().slice(0, 10)),
+          periodDate: sanitizePlainText(b.periodDate || new Date().toISOString().slice(0, 10), 20),
           revenueCents: revCents,
           ordersCount: orders,
           avgTicketCents: avgTicket,
-          grossMarginPct: String(b.grossMarginPct || ''),
+          grossMarginPct: sanitizePlainText(b.grossMarginPct, 24),
           lossesCents: Math.max(0, Math.round(Number(b.lossesReais || 0) * 100)),
-          sourceOrigin: String(b.sourceOrigin || 'Lançamento manual'),
-          reliabilityLevel: String(b.reliabilityLevel || 'alta'),
+          sourceOrigin: sanitizePlainText(b.sourceOrigin || 'Lançamento manual', 120) || 'Lançamento manual',
+          reliabilityLevel: sanitizePlainText(b.reliabilityLevel || 'alta', 32) || 'alta',
         })
         .returning();
 
@@ -2237,7 +2525,7 @@ async function startServer() {
       }
 
       const b = req.body as Record<string, unknown>;
-      const name = String(b.name || '').trim();
+      const name = sanitizePlainText(b.name, 160);
       if (!name) return res.status(400).json({ error: 'Nome do concorrente é obrigatório.' });
 
       const [comp] = await db
@@ -2245,19 +2533,19 @@ async function startServer() {
         .values({
           companyId,
           name,
-          segment: String(b.segment || ''),
-          positioning: String(b.positioning || ''),
-          announcedPriceRange: String(b.announcedPriceRange || ''),
-          shippingInfo: String(b.shippingInfo || ''),
-          deliveryDays: String(b.deliveryDays || ''),
-          publicRating: String(b.publicRating || ''),
-          complaintsNote: String(b.complaintsNote || ''),
-          lastChangeNote: String(b.lastChangeNote || ''),
-          sourceUrl: String(b.sourceUrl || ''),
-          channels: String(b.channels || ''),
-          priceComparison: String(b.priceComparison || 'Não informado'),
-          threatLevel: String(b.threatLevel || 'Impacto médio'),
-          reviewSnippetsJson: Array.isArray(b.reviewSnippets) ? b.reviewSnippets : [],
+          segment: sanitizePlainText(b.segment, 120),
+          positioning: sanitizePlainText(b.positioning, 400),
+          announcedPriceRange: sanitizePlainText(b.announcedPriceRange, 160),
+          shippingInfo: sanitizePlainText(b.shippingInfo, 240),
+          deliveryDays: sanitizePlainText(b.deliveryDays, 80),
+          publicRating: sanitizePlainText(b.publicRating, 40),
+          complaintsNote: sanitizePlainText(b.complaintsNote, 500),
+          lastChangeNote: sanitizePlainText(b.lastChangeNote, 400),
+          sourceUrl: sanitizeHttpUrl(b.sourceUrl),
+          channels: sanitizePlainText(b.channels, 200),
+          priceComparison: sanitizePlainText(b.priceComparison, 120) || 'Não informado',
+          threatLevel: sanitizePlainText(b.threatLevel, 60) || 'Impacto médio',
+          reviewSnippetsJson: Array.isArray(b.reviewSnippets) ? b.reviewSnippets.slice(0, 20) : [],
         })
         .returning();
 
@@ -3111,58 +3399,195 @@ async function startServer() {
     }
   });
 
-  // Contextual AI Assistant Endpoint
-  app.post('/api/beta/companies/:companyId/assistant', requireAuth, async (req: AuthRequest, res) => {
+  // Authenticated Company Owner Verified Backup Export
+  app.get('/api/beta/companies/:companyId/backup/export', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const companyId = Number(req.params.companyId);
+      const access = await getUserCompanyAccess(req.dbUser!.id, companyId);
+      if (!access || !['owner', 'admin'].includes(access.role)) {
+        return res.status(403).json({ error: 'Apenas proprietário ou administrador pode gerar backup verificado.' });
+      }
+      const result = await exportCompanyVerifiedBackup(companyId);
+      await recordAuditLog({
+        companyId,
+        userId: req.dbUser!.id,
+        userEmail: req.dbUser!.email,
+        action: 'EXPORT_VERIFIED_BACKUP',
+        entityType: 'backup_snapshot',
+        entityId: companyId,
+        details: { integritySha256: result.integritySha256 },
+      });
+      res.setHeader('X-Backup-SHA256', result.integritySha256);
+      res.json(result);
+    } catch (error) {
+      console.error('Company backup export error:', error instanceof Error ? error.message : 'error');
+      res.status(500).json({ error: 'Erro ao gerar backup verificado da empresa.' });
+    }
+  });
+
+  // Gêmeo Digital AI Status, Quota & Monitoring Endpoint
+  app.get('/api/beta/companies/:companyId/ai/status', requireAuth, async (req: AuthRequest, res) => {
     try {
       const companyId = Number(req.params.companyId);
       const access = await getUserCompanyAccess(req.dbUser!.id, companyId);
       if (!access) return res.status(403).json({ error: 'Acesso negado.' });
 
-      const { question, screenContext, history } = req.body as {
+      const [sub] = await db.select().from(subscriptions).where(eq(subscriptions.companyId, companyId));
+      const planCode = (sub?.planCode || 'profissional') as PlanCode;
+      const status = await getCompanyAiStatus(companyId, planCode);
+      res.json({
+        ...status,
+        userRole: access.role,
+        canAuthorizeActions: access.role !== 'viewer',
+      });
+    } catch (error) {
+      console.error('AI status error:', error instanceof Error ? error.message : 'error');
+      res.status(500).json({ error: 'Erro ao consultar monitoramento do Gêmeo Digital AI.' });
+    }
+  });
+
+  // Gêmeo Digital AI Executive Report & Multi-Sector Diagnostic
+  app.post('/api/beta/companies/:companyId/ai/report', requireAuth, aiHeavyLimiter, async (req: AuthRequest, res) => {
+    try {
+      const companyId = Number(req.params.companyId);
+      const access = await getUserCompanyAccess(req.dbUser!.id, companyId);
+      if (!access) return res.status(403).json({ error: 'Acesso negado.' });
+
+      const [sub] = await db.select().from(subscriptions).where(eq(subscriptions.companyId, companyId));
+      const planCode = (sub?.planCode || 'profissional') as PlanCode;
+
+      const report = await generateExecutiveAiReport({
+        company: access.company,
+        userId: req.dbUser!.id,
+        planCode,
+      });
+
+      await recordAuditLog({
+        companyId,
+        userId: req.dbUser!.id,
+        userEmail: req.dbUser!.email,
+        action: 'AI_EXECUTIVE_REPORT_GENERATED',
+        entityType: 'company',
+        entityId: companyId,
+        details: { companyName: access.company.name },
+      });
+
+      res.json({ report });
+    } catch (error: unknown) {
+      console.error('AI executive report error:', error instanceof Error ? error.message : 'error');
+      const friendly = formatFriendlyAiError(
+        error,
+        'Não foi possível gerar o diagnóstico executivo agora. O restante da plataforma continua operando normalmente.'
+      );
+      res.status(friendly.status).json({ error: friendly.message, code: friendly.code, degraded: friendly.status >= 500 || friendly.status === 429 });
+    }
+  });
+
+  // Gêmeo Digital AI User-Authorized Internal Action Execution
+  app.post('/api/beta/companies/:companyId/ai/actions/:proposalToken/approve', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const companyId = Number(req.params.companyId);
+      const access = await getUserCompanyAccess(req.dbUser!.id, companyId);
+      if (!access) return res.status(403).json({ error: 'Acesso negado.' });
+
+      const outcome = await resolveAiActionProposal({
+        proposalToken: String(req.params.proposalToken || ''),
+        companyId,
+        userId: req.dbUser!.id,
+        userEmail: req.dbUser!.email,
+        userRole: access.role,
+        action: 'approve',
+      });
+      res.status(outcome.statusCode).json(outcome);
+    } catch (error) {
+      console.error('AI action approve error:', error instanceof Error ? error.message : 'error');
+      res.status(500).json({ error: 'Erro ao autorizar e executar a ação sugerida pela IA.' });
+    }
+  });
+
+  app.post('/api/beta/companies/:companyId/ai/actions/:proposalToken/reject', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const companyId = Number(req.params.companyId);
+      const access = await getUserCompanyAccess(req.dbUser!.id, companyId);
+      if (!access) return res.status(403).json({ error: 'Acesso negado.' });
+
+      const outcome = await resolveAiActionProposal({
+        proposalToken: String(req.params.proposalToken || ''),
+        companyId,
+        userId: req.dbUser!.id,
+        userEmail: req.dbUser!.email,
+        userRole: access.role,
+        action: 'reject',
+      });
+      res.status(outcome.statusCode).json(outcome);
+    } catch (error) {
+      console.error('AI action reject error:', error instanceof Error ? error.message : 'error');
+      res.status(500).json({ error: 'Erro ao cancelar a proposta sugerida pela IA.' });
+    }
+  });
+
+  // Contextual Gêmeo Digital AI Assistant Endpoint (supports multimodal docs/spreadsheets + function calling)
+  app.post('/api/beta/companies/:companyId/assistant', requireAuth, aiHeavyLimiter, async (req: AuthRequest, res) => {
+    try {
+      const companyId = Number(req.params.companyId);
+      const access = await getUserCompanyAccess(req.dbUser!.id, companyId);
+      if (!access) return res.status(403).json({ error: 'Acesso negado.' });
+
+      const { question, screenContext, history, attachment } = req.body as {
         question?: string;
         screenContext?: string;
         history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+        attachment?: GemeoChatAttachmentInput | null;
       };
-      if (!question || !question.trim()) {
-        return res.status(400).json({ error: 'Pergunta é obrigatória.' });
+      const cleanQuestion = sanitizePlainText(question, 3000);
+      if (!cleanQuestion && !attachment?.base64Data) {
+        return res.status(400).json({ error: 'Pergunta ou arquivo anexo é obrigatório.' });
       }
 
-      const [snapshot, dirSummary] = await Promise.all([
-        buildCompanyContextSnapshot(access.company),
+      const [dirSummary, [sub]] = await Promise.all([
         buildUserCompaniesAndDistanceSummary(req.dbUser!.id, companyId),
+        db.select().from(subscriptions).where(eq(subscriptions.companyId, companyId)),
       ]);
+      const planCode = (sub?.planCode || 'profissional') as PlanCode;
 
-      const result = await askStrategicAssistant({
-        question: question.trim(),
-        screenContext: screenContext || 'Painel Geral',
-        snapshot,
-        history: Array.isArray(history) ? history : [],
+      const result = await runGemeoDigitalAiChat({
+        company: access.company,
+        userId: req.dbUser!.id,
+        userRole: access.role,
+        planCode,
+        question: cleanQuestion || 'Analise o documento/planilha anexado considerando os dados reais da empresa.',
+        screenContext: sanitizePlainText(screenContext, 160) || 'Gêmeo Digital AI',
+        history: Array.isArray(history) ? history.slice(-30) : [],
         companiesDirectoryText: dirSummary.companiesDirectoryText,
         distanceQueriesSummary: dirSummary.distanceQueriesSummary,
         userLatLng: dirSummary.activeLatLng,
+        attachment: attachment || null,
+        moduleName: 'gemeo_ai_panel',
       });
 
       res.json(result);
     } catch (error: unknown) {
-      console.error('Assistant error:', error);
+      console.error('Assistant error:', error instanceof Error ? error.message : 'error');
       const friendly = formatFriendlyAiError(
         error,
-        'Não foi possível consultar o assistente de inteligência no momento. Tente novamente em instantes.'
+        'Não foi possível consultar o Gêmeo Digital AI no momento. O restante do painel continua operando normalmente.'
       );
-      res.status(friendly.status).json({ error: friendly.message });
+      res.status(friendly.status).json({ error: friendly.message, code: friendly.code, degraded: friendly.status >= 500 || friendly.status === 429 });
     }
   });
 
-  // Global Authenticated Gemini Chatbot (Cloud SQL user companies + distances + Maps & Search Grounding)
-  app.post('/api/chat', requireAuth, async (req: AuthRequest, res) => {
+  // Global Authenticated Gemini Chatbot (delegates to Gêmeo Digital AI when an active company is selected)
+  app.post('/api/chat', requireAuth, aiHeavyLimiter, async (req: AuthRequest, res) => {
     try {
-      const { question, screenContext, history, companyId } = req.body as {
+      const { question, screenContext, history, companyId, attachment } = req.body as {
         question?: string;
         screenContext?: string;
         history?: Array<{ role: 'user' | 'assistant'; content: string }>;
         companyId?: number | null;
+        attachment?: GemeoChatAttachmentInput | null;
       };
-      if (!question || !question.trim()) {
+      const cleanQuestion = sanitizePlainText(question, 3000);
+      if (!cleanQuestion && !attachment?.base64Data) {
         return res.status(400).json({ error: 'Pergunta é obrigatória.' });
       }
 
@@ -3173,33 +3598,50 @@ async function startServer() {
         activeAccess = await getUserCompanyAccess(dbUserId, requestedCompanyId);
       }
 
-      const [dirSummary, snapshot] = await Promise.all([
-        buildUserCompaniesAndDistanceSummary(
-          dbUserId,
-          activeAccess ? activeAccess.company.id : undefined
-        ),
-        activeAccess ? buildCompanyContextSnapshot(activeAccess.company) : Promise.resolve(null),
-      ]);
+      const dirSummary = await buildUserCompaniesAndDistanceSummary(
+        dbUserId,
+        activeAccess ? activeAccess.company.id : undefined
+      );
+
+      if (activeAccess) {
+        const [sub] = await db.select().from(subscriptions).where(eq(subscriptions.companyId, activeAccess.company.id));
+        const planCode = (sub?.planCode || 'profissional') as PlanCode;
+        const result = await runGemeoDigitalAiChat({
+          company: activeAccess.company,
+          userId: dbUserId,
+          userRole: activeAccess.role,
+          planCode,
+          question: cleanQuestion || 'Analise o documento/planilha anexado.',
+          screenContext: sanitizePlainText(screenContext, 160) || 'Chatbot Global Gêmeo Digital',
+          history: Array.isArray(history) ? history.slice(-30) : [],
+          companiesDirectoryText: dirSummary.companiesDirectoryText,
+          distanceQueriesSummary: dirSummary.distanceQueriesSummary,
+          userLatLng: dirSummary.activeLatLng,
+          attachment: attachment || null,
+          moduleName: 'global_chatbot',
+        });
+        return res.json(result);
+      }
 
       const result = await askGroundedChatbot({
-        question: question.trim(),
-        screenContext: screenContext || 'Plataforma Gêmeo Digital',
+        question: cleanQuestion,
+        screenContext: sanitizePlainText(screenContext, 160) || 'Plataforma Gêmeo Digital',
         history: Array.isArray(history) ? history : [],
         isAuthenticated: true,
         companiesDirectoryText: dirSummary.companiesDirectoryText,
         distanceQueriesSummary: dirSummary.distanceQueriesSummary,
-        activeCompanySnapshot: snapshot,
+        activeCompanySnapshot: null,
         userLatLng: dirSummary.activeLatLng,
       });
 
       res.json(result);
     } catch (error: unknown) {
-      console.error('Global chat error:', error);
+      console.error('Global chat error:', error instanceof Error ? error.message : 'error');
       const friendly = formatFriendlyAiError(
         error,
         'Não foi possível consultar o chatbot no momento. Tente novamente em instantes.'
       );
-      res.status(friendly.status).json({ error: friendly.message });
+      res.status(friendly.status).json({ error: friendly.message, code: friendly.code, degraded: friendly.status >= 500 || friendly.status === 429 });
     }
   });
 
@@ -4108,7 +4550,7 @@ async function startServer() {
     try {
       const companyId = Number(req.params.companyId);
       const access = await getUserCompanyAccess(req.dbUser!.id, companyId);
-      if (!access) return res.status(403).json({ error: 'Acesso negado.' });
+      if (!access || access.role === 'viewer') return res.status(403).json({ error: 'Sem permissão.' });
 
       const b = req.body as {
         entityKind?: string;
@@ -4135,12 +4577,33 @@ async function startServer() {
         syncToCompetitorsTab?: boolean;
       };
 
-      if (!b.name || !String(b.name).trim()) {
+      const cleanName = sanitizePlainText(b.name, 160);
+      if (!cleanName) {
         return res.status(400).json({ error: 'Nome do estabelecimento é obrigatório.' });
       }
 
-      const entityKind = b.entityKind || 'competitor';
-      const placeId = String(b.placeId || '').trim();
+      const entityKind = ['competitor', 'supplier', 'partner', 'client'].includes(String(b.entityKind || ''))
+        ? String(b.entityKind)
+        : 'competitor';
+      const classification = sanitizePlainText(
+        b.classification || (entityKind === 'supplier' ? 'strategic' : 'direct'),
+        40
+      );
+      const placeId = sanitizePlainText(b.placeId, 140);
+      const cleanAddress = sanitizePlainText(b.address, 260);
+      const cleanCity = sanitizePlainText(b.city, 100);
+      const cleanState = sanitizePlainText(b.state, 32);
+      const cleanCategory = sanitizePlainText(b.category, 100);
+      const cleanWebsite = sanitizeHttpUrl(b.website);
+      const cleanGoogleMapsUri = sanitizeHttpUrl(b.googleMapsUri);
+      const cleanPhone = sanitizePlainText(b.phone, 40);
+      const cleanNotes = sanitizePlainText(b.notes, 1000);
+      const cleanSourceName = sanitizePlainText(b.sourceName || 'Google Places API (New)', 120) || 'Google Places API (New)';
+      const cleanPriceLevel = sanitizePlainText(b.priceLevel, 80);
+      const cleanTravelTime = sanitizePlainText(b.travelTimeText, 80);
+      const cleanOpeningHours = Array.isArray(b.openingHours)
+        ? b.openingHours.slice(0, 14).map((h) => sanitizePlainText(h, 120)).filter(Boolean)
+        : [];
 
       if (placeId) {
         const existing = await db
@@ -4157,13 +4620,13 @@ async function startServer() {
           const [updated] = await db
             .update(geoSavedEntities)
             .set({
-              classification: b.classification || existing[0].classification,
-              distanceKm: b.distanceKm !== undefined ? String(b.distanceKm) : existing[0].distanceKm,
-              travelTimeText: b.travelTimeText || existing[0].travelTimeText,
+              classification: classification || existing[0].classification,
+              distanceKm: b.distanceKm !== undefined ? sanitizePlainText(b.distanceKm, 24) : existing[0].distanceKm,
+              travelTimeText: cleanTravelTime || existing[0].travelTimeText,
               publicRating:
-                b.rating !== undefined && b.rating !== null ? String(b.rating) : existing[0].publicRating,
-              userRatingsTotal: Number(b.userRatingsTotal ?? existing[0].userRatingsTotal),
-              notes: b.notes !== undefined ? b.notes : existing[0].notes,
+                b.rating !== undefined && b.rating !== null ? sanitizePlainText(b.rating, 16) : existing[0].publicRating,
+              userRatingsTotal: Math.max(0, Math.round(Number(b.userRatingsTotal ?? existing[0].userRatingsTotal) || 0)),
+              notes: b.notes !== undefined ? cleanNotes : existing[0].notes,
               lastUpdatedAt: new Date(),
             })
             .where(eq(geoSavedEntities.id, existing[0].id))
@@ -4177,26 +4640,26 @@ async function startServer() {
         .values({
           companyId,
           entityKind,
-          classification: b.classification || (entityKind === 'supplier' ? 'strategic' : 'direct'),
+          classification: classification || (entityKind === 'supplier' ? 'strategic' : 'direct'),
           placeId,
-          name: String(b.name).trim(),
-          address: String(b.address || ''),
-          city: String(b.city || ''),
-          state: String(b.state || ''),
-          latitude: b.lat !== undefined ? String(b.lat) : '',
-          longitude: b.lng !== undefined ? String(b.lng) : '',
-          distanceKm: b.distanceKm !== undefined ? String(b.distanceKm) : '',
-          travelTimeText: String(b.travelTimeText || ''),
-          category: String(b.category || ''),
-          website: String(b.website || ''),
-          phone: String(b.phone || ''),
-          publicRating: b.rating !== undefined && b.rating !== null ? String(b.rating) : '',
-          userRatingsTotal: Number(b.userRatingsTotal || 0),
-          priceLevel: String(b.priceLevel || ''),
-          openingHoursJson: Array.isArray(b.openingHours) ? b.openingHours : [],
-          sourceName: String(b.sourceName || 'Google Places API (New)'),
-          googleMapsUri: String(b.googleMapsUri || ''),
-          notes: String(b.notes || ''),
+          name: cleanName,
+          address: cleanAddress,
+          city: cleanCity,
+          state: cleanState,
+          latitude: b.lat !== undefined && Number.isFinite(Number(b.lat)) ? String(Number(b.lat)) : '',
+          longitude: b.lng !== undefined && Number.isFinite(Number(b.lng)) ? String(Number(b.lng)) : '',
+          distanceKm: b.distanceKm !== undefined ? sanitizePlainText(b.distanceKm, 24) : '',
+          travelTimeText: cleanTravelTime,
+          category: cleanCategory,
+          website: cleanWebsite,
+          phone: cleanPhone,
+          publicRating: b.rating !== undefined && b.rating !== null ? sanitizePlainText(b.rating, 16) : '',
+          userRatingsTotal: Math.max(0, Math.round(Number(b.userRatingsTotal || 0) || 0)),
+          priceLevel: cleanPriceLevel,
+          openingHoursJson: cleanOpeningHours,
+          sourceName: cleanSourceName,
+          googleMapsUri: cleanGoogleMapsUri,
+          notes: cleanNotes,
         })
         .returning();
 
@@ -4206,23 +4669,23 @@ async function startServer() {
           .from(competitors)
           .where(eq(competitors.companyId, companyId));
         const exists = curComps.some(
-          (c) => c.name.toLowerCase().trim() === String(b.name).toLowerCase().trim()
+          (c) => c.name.toLowerCase().trim() === cleanName.toLowerCase().trim()
         );
         if (!exists) {
           await db.insert(competitors).values({
             companyId,
-            name: String(b.name).trim(),
-            segment: String(b.category || access.company.segment || ''),
-            positioning: `${b.address || ''} (${b.distanceKm ? `${b.distanceKm} km` : 'Radar Geo'})`.trim(),
-            announcedPriceRange: String(b.priceLevel || 'Não divulgado publicamente'),
-            publicRating: b.rating ? `${b.rating}/5 (${b.userRatingsTotal || 0} aval.)` : '',
-            sourceUrl: String(b.googleMapsUri || b.website || ''),
-            channels: b.website ? 'Loja física + Site oficial' : 'Loja física / Google Maps',
+            name: cleanName,
+            segment: cleanCategory || access.company.segment || '',
+            positioning: `${cleanAddress} (${b.distanceKm ? `${sanitizePlainText(b.distanceKm, 20)} km` : 'Radar Geo'})`.trim(),
+            announcedPriceRange: cleanPriceLevel || 'Não divulgado publicamente',
+            publicRating: b.rating ? `${sanitizePlainText(b.rating, 10)}/5 (${Math.max(0, Number(b.userRatingsTotal || 0))} aval.)` : '',
+            sourceUrl: cleanGoogleMapsUri || cleanWebsite,
+            channels: cleanWebsite ? 'Loja física + Site oficial' : 'Loja física / Google Maps',
             threatLevel:
-              b.classification === 'direct' ? 'Impacto alto' : 'Impacto médio',
+              classification === 'direct' ? 'Impacto alto' : 'Impacto médio',
             lastChangeNote: `Sincronizado via Inteligência Geográfica em ${new Date().toLocaleDateString('pt-BR')}`,
             reviewSnippetsJson: {
-              locationDistance: b.distanceKm ? `${b.distanceKm} km` : '',
+              locationDistance: b.distanceKm ? `${sanitizePlainText(b.distanceKm, 20)} km` : '',
               consultedAt: new Date().toLocaleDateString('pt-BR'),
             },
           });
@@ -4251,7 +4714,7 @@ async function startServer() {
       const companyId = Number(req.params.companyId);
       const entityId = Number(req.params.entityId);
       const access = await getUserCompanyAccess(req.dbUser!.id, companyId);
-      if (!access) return res.status(403).json({ error: 'Acesso negado.' });
+      if (!access || access.role === 'viewer') return res.status(403).json({ error: 'Sem permissão.' });
 
       await db
         .delete(geoSavedEntities)
@@ -4584,17 +5047,38 @@ async function startServer() {
     }
   });
 
-  app.post('/api/beta/companies/:companyId/financial/import-workbook', requireAuth, async (req: AuthRequest, res) => {
+  app.post('/api/beta/companies/:companyId/financial/import-workbook', requireAuth, uploadLimiter, async (req: AuthRequest, res) => {
     try {
+      const ctx = extractClientSecurityContext(req);
       const companyId = Number(req.params.companyId);
       const access = await getUserCompanyAccess(req.dbUser!.id, companyId);
       if (!access || access.role === 'viewer') return res.status(403).json({ error: 'Sem permissão.' });
 
       const { fileName, base64Data } = req.body as { fileName?: string; base64Data?: string };
       if (!base64Data) return res.status(400).json({ error: 'Arquivo não enviado.' });
-      const cleanB64 = base64Data.includes(',') ? base64Data.split(',')[1] : base64Data;
-      const buf = Buffer.from(cleanB64, 'base64');
-      const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+      const checked = inspectDocumentOrImageUpload({
+        fileName: fileName || 'planilha.xlsx',
+        mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        base64Data,
+      });
+      if (!checked.ok) {
+        void recordSecurityEvent({
+          eventType: 'UPLOAD_REJECTED',
+          severity: 'medium',
+          ip: ctx.ip,
+          method: req.method,
+          path: req.path,
+          userId: req.dbUser!.id,
+          companyId,
+          cfRay: ctx.cfRay,
+          cfCountry: ctx.cfCountry,
+          userAgent: ctx.userAgent,
+          details: { reason: checked.error, fileName: checked.safeFileName },
+        });
+        return res.status(400).json({ error: checked.error });
+      }
+      const buf = checked.buffer;
+      const ab = Uint8Array.from(buf).buffer;
       const parsed = parseFinancialWorkbookBuffer(ab);
 
       const categoryNames = new Set<string>();
@@ -4738,6 +5222,23 @@ async function startServer() {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
+
+  // Global fallback error handler (never expose internal stack traces to clients)
+  app.use(
+    (
+      err: unknown,
+      _req: express.Request,
+      res: express.Response,
+      _next: express.NextFunction
+    ) => {
+      console.error('Unhandled server error:', err instanceof Error ? err.message : 'unknown');
+      if (res.headersSent) return;
+      res.status(500).json({ error: 'Erro interno ao processar a solicitação.' });
+    }
+  );
+
+  // Start automated periodic database backups with SHA-256 verification
+  startPeriodicBackups();
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Gêmeo Digital server running on http://0.0.0.0:${PORT}`);

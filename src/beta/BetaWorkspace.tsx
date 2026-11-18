@@ -20,13 +20,16 @@ import {
   FileSpreadsheet,
   FileText,
   Globe,
+  History,
   Info,
   LayoutDashboard,
   Lightbulb,
   Loader2,
   LogOut,
   MapPin,
+  MessageSquarePlus,
   Package,
+  Paperclip,
   Plus,
   Radar,
   RefreshCw,
@@ -34,6 +37,7 @@ import {
   Send,
   Settings,
   Share2,
+  ShieldAlert,
   ShieldCheck,
   Sliders,
   Sparkles,
@@ -49,6 +53,7 @@ import {
 import { useBetaAuth } from './AuthContext';
 import { BetaBadge } from './BetaAuthPages';
 import { GeoIntelligenceModule } from '../components/GeoIntelligenceModule';
+import { safeExternalHref } from '../lib/safeUrl';
 import {
   FinancialOperationsModule,
   type CrossAnalysisDisplay,
@@ -75,11 +80,24 @@ import {
   type NavGroup,
 } from '../components/ui/TwinUI';
 import {
+  appendChatMessage,
+  createUserChat,
+  deleteUserChat,
+  subscribeChatMessages,
+  subscribeUserChats,
+  type ChatToolUsed,
+  type FirestoreChatMessage,
+  type FirestoreChatSession,
+  type GroundingLinkItem,
+} from '../lib/firestoreStore';
+import {
   downloadCatalogTemplateExcel,
   downloadImportTemplateExcel,
   downloadSalesUnitsTemplateExcel,
+  exportAiExecutiveReportPDF,
   exportExecutiveReportExcel,
   exportExecutiveReportPDF,
+  type AiExecutiveReportExportPayload,
 } from '../components/ReportExporter';
 import {
   parseCatalogSpreadsheet,
@@ -582,17 +600,80 @@ export const BetaWorkspace: React.FC = () => {
   } | null>(null);
   const [advisingSimulator, setAdvisingSimulator] = useState(false);
 
-  // Full-page Assistant state
+  // Full-page Gêmeo Digital AI Central Module state
   const [fullAiInput, setFullAiInput] = useState('');
   const [fullAiLoading, setFullAiLoading] = useState(false);
   const [fullAiMessages, setFullAiMessages] = useState<
     Array<{
       role: 'user' | 'assistant';
       content: string;
+      toolUsed?: ChatToolUsed;
       sourcesUsed?: string[];
+      toolsInvoked?: string[];
       groundingLinks?: Array<{ title: string; uri: string }>;
     }>
   >([]);
+  const [aiStatus, setAiStatus] = useState<{
+    aiConfigured: boolean;
+    availability: 'online' | 'degraded' | 'unconfigured';
+    model: string;
+    planName: string;
+    dailyUsed: number;
+    dailyLimit: number;
+    remainingToday: number;
+    avgLatencyMs: number;
+    successCount24h: number;
+    errorCount24h: number;
+    recentCalls: Array<{
+      id: number;
+      module: string;
+      toolUsed: string;
+      status: string;
+      latencyMs: number;
+      errorCode?: string | null;
+      createdAt: string;
+    }>;
+    pendingProposals: Array<{
+      proposalToken: string;
+      functionName: string;
+      title: string;
+      summary: string;
+      args: Record<string, unknown>;
+      status: string;
+      expiresAt: string;
+      createdAt: string;
+    }>;
+    userRole: string;
+    canAuthorizeActions: boolean;
+  } | null>(null);
+  const [aiStatusLoading, setAiStatusLoading] = useState(false);
+  const [aiDegradedBanner, setAiDegradedBanner] = useState('');
+  const [aiChats, setAiChats] = useState<FirestoreChatSession[]>([]);
+  const [activeAiChatId, setActiveAiChatId] = useState<string | null>(null);
+  const [aiChatMessages, setAiChatMessages] = useState<FirestoreChatMessage[]>([]);
+  const [showAiHistory, setShowAiHistory] = useState(false);
+  const [aiAttachment, setAiAttachment] = useState<{
+    fileName: string;
+    mimeType: string;
+    base64Data: string;
+    sizeBytes: number;
+  } | null>(null);
+  const aiAttachmentInputRef = useRef<HTMLInputElement | null>(null);
+  const [aiPendingProposals, setAiPendingProposals] = useState<
+    Array<{
+      proposalToken: string;
+      functionName: string;
+      title: string;
+      summary: string;
+      args: Record<string, unknown>;
+      status: string;
+      expiresAt: string;
+      createdAt: string;
+    }>
+  >([]);
+  const [resolvingProposalToken, setResolvingProposalToken] = useState<string | null>(null);
+  const [aiExecutiveReport, setAiExecutiveReport] = useState<AiExecutiveReportExportPayload | null>(null);
+  const [generatingAiReport, setGeneratingAiReport] = useState(false);
 
   // Company edit, Team invite, Config tab & Firestore User Preferences
   const [companyEdit, setCompanyEdit] = useState<Record<string, string>>({});
@@ -683,9 +764,83 @@ export const BetaWorkspace: React.FC = () => {
     }
   }, [activeCompanyId, apiFetch]);
 
+  const loadAiStatus = useCallback(async () => {
+    if (!activeCompanyId) return;
+    setAiStatusLoading(true);
+    try {
+      const status = await apiFetch<NonNullable<typeof aiStatus>>(
+        `/api/beta/companies/${activeCompanyId}/ai/status`
+      );
+      setAiStatus(status);
+      setAiPendingProposals(Array.isArray(status.pendingProposals) ? status.pendingProposals : []);
+    } catch {
+      // keep existing UI operational if AI status fails
+    } finally {
+      setAiStatusLoading(false);
+    }
+  }, [activeCompanyId, apiFetch]);
+
   useEffect(() => {
     loadWorkspace();
   }, [loadWorkspace]);
+
+  // Refresh workspace when an authorized action is approved from the floating chatbot
+  useEffect(() => {
+    const handleWorkspaceRefresh = () => {
+      void loadWorkspace();
+      void loadAiStatus();
+    };
+    window.addEventListener('gemeo-workspace-updated', handleWorkspaceRefresh);
+    return () => window.removeEventListener('gemeo-workspace-updated', handleWorkspaceRefresh);
+  }, [loadWorkspace, loadAiStatus]);
+
+  // Reset AI module state when switching active company
+  useEffect(() => {
+    setActiveAiChatId(null);
+    setAiAttachment(null);
+    setAiExecutiveReport(null);
+    setAiDegradedBanner('');
+    setFullAiMessages([]);
+    if (activeCompanyId) {
+      void loadAiStatus();
+    } else {
+      setAiStatus(null);
+      setAiPendingProposals([]);
+    }
+  }, [activeCompanyId, loadAiStatus]);
+
+  // Subscribe to per-company Firestore conversation history for Gêmeo Digital AI
+  useEffect(() => {
+    if (!firebaseUser || !activeCompanyId) {
+      setAiChats([]);
+      setActiveAiChatId(null);
+      setAiChatMessages([]);
+      return;
+    }
+    const unsub = subscribeUserChats(
+      firebaseUser.uid,
+      (companyChats) => {
+        setAiChats(companyChats);
+        setActiveAiChatId((prev) => {
+          if (prev && companyChats.some((c) => c.id === prev)) return prev;
+          return companyChats.length > 0 ? companyChats[0].id : null;
+        });
+      },
+      activeCompanyId
+    );
+    return () => unsub();
+  }, [firebaseUser, activeCompanyId]);
+
+  useEffect(() => {
+    if (!firebaseUser || !activeAiChatId) {
+      setAiChatMessages([]);
+      return;
+    }
+    const unsub = subscribeChatMessages(firebaseUser.uid, activeAiChatId, (msgs) => {
+      setAiChatMessages(msgs);
+    });
+    return () => unsub();
+  }, [firebaseUser, activeAiChatId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1423,46 +1578,228 @@ export const BetaWorkspace: React.FC = () => {
     }
   };
 
+  const handlePickAiAttachment = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (file.size > 6 * 1024 * 1024) {
+      showToast('O arquivo excede o limite de 6 MB para análise direta no chat.');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const res = String(reader.result || '');
+      const base64 = res.includes(',') ? res.split(',')[1] : res;
+      setAiAttachment({
+        fileName: file.name,
+        mimeType: file.type || 'application/octet-stream',
+        base64Data: base64,
+        sizeBytes: file.size,
+      });
+    };
+    reader.onerror = () => {
+      showToast('Não foi possível ler o arquivo selecionado.');
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleNewAiChat = async () => {
+    setAiDegradedBanner('');
+    if (!firebaseUser || !activeCompanyId || !workspace) {
+      setFullAiMessages([]);
+      return;
+    }
+    try {
+      const chatId = await createUserChat(firebaseUser.uid, {
+        title: `Gêmeo Digital AI · ${workspace.company.name}`,
+        companyId: activeCompanyId,
+        companyName: workspace.company.name,
+      });
+      setActiveAiChatId(chatId);
+      setShowAiHistory(false);
+    } catch {
+      showToast('Não foi possível criar uma nova conversa no Firestore agora.');
+    }
+  };
+
+  const handleDeleteAiChat = async (chatId: string) => {
+    if (!firebaseUser) return;
+    try {
+      await deleteUserChat(firebaseUser.uid, chatId);
+      if (activeAiChatId === chatId) {
+        const remaining = aiChats.filter((c) => c.id !== chatId);
+        setActiveAiChatId(remaining[0]?.id || null);
+      }
+    } catch {
+      showToast('Não foi possível excluir a conversa selecionada.');
+    }
+  };
+
+  const handleResolveAiProposal = async (proposalToken: string, action: 'approve' | 'reject') => {
+    if (!activeCompanyId || resolvingProposalToken) return;
+    setResolvingProposalToken(proposalToken);
+    setAiDegradedBanner('');
+    try {
+      const outcome = await apiFetch<{ ok?: boolean; message?: string }>(
+        `/api/beta/companies/${activeCompanyId}/ai/actions/${encodeURIComponent(proposalToken)}/${action}`,
+        { method: 'POST', body: JSON.stringify({}) }
+      );
+      setAiPendingProposals((prev) => prev.filter((p) => p.proposalToken !== proposalToken));
+      showToast(
+        outcome.message ||
+          (action === 'approve' ? 'Ação autorizada e executada na empresa.' : 'Proposta cancelada.')
+      );
+      if (action === 'approve') {
+        await loadWorkspace();
+      }
+      await loadAiStatus();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Não foi possível resolver a proposta.');
+    } finally {
+      setResolvingProposalToken(null);
+    }
+  };
+
+  const handleGenerateAiExecutiveReport = async () => {
+    if (!activeCompanyId || generatingAiReport) return;
+    setGeneratingAiReport(true);
+    setAiDegradedBanner('');
+    try {
+      const res = await apiFetch<{ report: AiExecutiveReportExportPayload }>(
+        `/api/beta/companies/${activeCompanyId}/ai/report`,
+        { method: 'POST', body: JSON.stringify({}) }
+      );
+      setAiExecutiveReport(res.report);
+      showToast('Diagnóstico executivo Gêmeo Digital AI gerado com dados reais.');
+      void loadAiStatus();
+    } catch (err) {
+      const msg =
+        err instanceof Error
+          ? err.message
+          : 'Não foi possível gerar o diagnóstico executivo no momento.';
+      setAiDegradedBanner(msg);
+      showToast(msg);
+    } finally {
+      setGeneratingAiReport(false);
+    }
+  };
+
   const askFullAssistant = async (questionText: string) => {
     const q = questionText.trim();
-    if (!q || !activeCompanyId || fullAiLoading) return;
-    const next = [...fullAiMessages, { role: 'user' as const, content: q }];
-    setFullAiMessages(next);
+    const currentAttachment = aiAttachment;
+    if ((!q && !currentAttachment) || !activeCompanyId || fullAiLoading) return;
+
+    const effectiveQuestion =
+      q || `Analise o arquivo anexo (${currentAttachment?.fileName || 'documento'}) no contexto da empresa.`;
+    const displayUserMsg = currentAttachment
+      ? `${effectiveQuestion}\n[Anexo: ${currentAttachment.fileName}]`
+      : effectiveQuestion;
+
+    setAiDegradedBanner('');
     setFullAiInput('');
+    setAiAttachment(null);
     setFullAiLoading(true);
+
+    const activeHistory = firebaseUser
+      ? aiChatMessages.map((m) => ({ role: m.role, content: m.content }))
+      : fullAiMessages.map((m) => ({ role: m.role, content: m.content }));
+
     try {
+      let chatId = activeAiChatId;
+      let currentCount = aiChats.find((c) => c.id === chatId)?.messageCount || aiChatMessages.length;
+
+      if (firebaseUser) {
+        if (!chatId) {
+          chatId = await createUserChat(firebaseUser.uid, {
+            title: effectiveQuestion.slice(0, 80),
+            companyId: activeCompanyId,
+            companyName: workspace?.company.name || '',
+          });
+          setActiveAiChatId(chatId);
+          currentCount = 0;
+        }
+        await appendChatMessage(firebaseUser.uid, chatId, {
+          role: 'user',
+          content: displayUserMsg,
+          toolUsed: 'general',
+          screenContext: 'Gêmeo Digital AI (Módulo Central)',
+          currentMessageCount: currentCount,
+          titleIfEmpty: currentCount === 0 ? effectiveQuestion.slice(0, 80) : undefined,
+          companyId: activeCompanyId,
+          companyName: workspace?.company.name || '',
+        });
+      } else {
+        setFullAiMessages((prev) => [...prev, { role: 'user', content: displayUserMsg }]);
+      }
+
       const res = await apiFetch<{
         answer: string;
+        toolUsed?: ChatToolUsed;
         sourcesUsed?: string[];
-        groundingLinks?: Array<{ title: string; uri: string }>;
+        toolsInvoked?: string[];
+        groundingLinks?: GroundingLinkItem[];
+        pendingProposals?: typeof aiPendingProposals;
       }>(`/api/beta/companies/${activeCompanyId}/assistant`, {
         method: 'POST',
         body: JSON.stringify({
-          question: q,
-          screenContext: 'Assistente de Inteligência (Página Dedicada)',
-          history: next,
+          question: effectiveQuestion,
+          screenContext: 'Gêmeo Digital AI (Módulo Central)',
+          history: [...activeHistory, { role: 'user', content: displayUserMsg }],
+          attachment: currentAttachment
+            ? {
+                fileName: currentAttachment.fileName,
+                mimeType: currentAttachment.mimeType,
+                base64Data: currentAttachment.base64Data,
+              }
+            : null,
         }),
       });
-      setFullAiMessages((prev) => [
-        ...prev,
-        {
+
+      if (Array.isArray(res.pendingProposals) && res.pendingProposals.length > 0) {
+        setAiPendingProposals((prev) => {
+          const map = new Map(prev.map((p) => [p.proposalToken, p]));
+          res.pendingProposals!.forEach((p) => map.set(p.proposalToken, p));
+          return Array.from(map.values());
+        });
+      }
+
+      if (firebaseUser && chatId) {
+        await appendChatMessage(firebaseUser.uid, chatId, {
           role: 'assistant',
           content: res.answer,
-          sourcesUsed: res.sourcesUsed,
-          groundingLinks: res.groundingLinks,
-        },
-      ]);
+          toolUsed: res.toolUsed || 'cloudsql',
+          screenContext: 'Gêmeo Digital AI (Módulo Central)',
+          groundingLinks: res.groundingLinks || [],
+          sourcesUsed: res.sourcesUsed || [],
+          currentMessageCount: currentCount + 1,
+          companyId: activeCompanyId,
+          companyName: workspace?.company.name || '',
+        });
+      } else {
+        setFullAiMessages((prev) => [
+          ...prev,
+          {
+            role: 'assistant',
+            content: res.answer,
+            toolUsed: res.toolUsed,
+            sourcesUsed: res.sourcesUsed,
+            toolsInvoked: res.toolsInvoked,
+            groundingLinks: res.groundingLinks,
+          },
+        ]);
+      }
+
+      void loadAiStatus();
     } catch (err) {
-      setFullAiMessages((prev) => [
-        ...prev,
-        {
-          role: 'assistant',
-          content:
-            err instanceof Error
-              ? err.message
-              : 'Não foi possível concluir a consulta agora. Tente novamente em instantes.',
-        },
-      ]);
+      const msg =
+        err instanceof Error
+          ? err.message
+          : 'Não foi possível concluir a consulta agora. O restante da plataforma continua operando normalmente.';
+      setAiDegradedBanner(msg);
+      if (!firebaseUser) {
+        setFullAiMessages((prev) => [...prev, { role: 'assistant', content: msg }]);
+      }
+      void loadAiStatus();
     } finally {
       setFullAiLoading(false);
     }
@@ -1709,7 +2046,7 @@ export const BetaWorkspace: React.FC = () => {
         { id: 'planos-acao', label: 'Planos de ação', icon: Briefcase },
         { id: 'oportunidades', label: 'Oportunidades', icon: Lightbulb },
         { id: 'simulador', label: 'Simulador de cenários', icon: Sliders },
-        { id: 'assistente', label: 'Assistente de inteligência', icon: Bot },
+        { id: 'assistente', label: 'Gêmeo Digital AI', icon: Bot },
       ],
     },
     {
@@ -3278,15 +3615,15 @@ export const BetaWorkspace: React.FC = () => {
                     'Ao cadastrar/entrar na empresa, o sistema busca automaticamente o estabelecimento e suas avaliações públicas no Google Maps.'}
                 </p>
 
-                {rep?.googleMapsUri && (
+                {safeExternalHref(rep?.googleMapsUri) && (
                   <a
-                    href={rep.googleMapsUri}
+                    href={safeExternalHref(rep?.googleMapsUri)}
                     target="_blank"
-                    rel="noreferrer"
+                    rel="noopener noreferrer"
                     className="inline-flex items-center gap-1 text-[#20C5D5] hover:underline font-medium"
                   >
                     <ExternalLink className="h-3.5 w-3.5" />
-                    <span>Abrir ficha pública no Google Maps ({rep.googlePlaceName || workspace.company.name})</span>
+                    <span>Abrir ficha pública no Google Maps ({rep?.googlePlaceName || workspace.company.name})</span>
                   </a>
                 )}
               </div>
@@ -3712,11 +4049,11 @@ export const BetaWorkspace: React.FC = () => {
                         ]}
                         footerActions={
                           <div className="flex items-center gap-2">
-                            {meta.sourceUrl && (
+                            {safeExternalHref(meta.sourceUrl) && (
                               <a
-                                href={meta.sourceUrl}
+                                href={safeExternalHref(meta.sourceUrl)}
                                 target="_blank"
-                                rel="noreferrer"
+                                rel="noopener noreferrer"
                                 className="inline-flex items-center gap-1 rounded-lg border border-[var(--border-subtle)] px-2.5 py-1 text-[11px] text-[#20C5D5] hover:border-[#20C5D5]"
                               >
                                 <ExternalLink className="h-3 w-3" />
@@ -3844,11 +4181,11 @@ export const BetaWorkspace: React.FC = () => {
                       <div className="space-y-2">
                         <div className="flex items-center justify-between gap-2 text-[11px] text-[var(--text-secondary)]">
                           <span className="truncate">{m.source} · {m.referenceDate || 'Atual'}</span>
-                          {m.sourceUrl && (
+                          {safeExternalHref(m.sourceUrl) && (
                             <a
-                              href={m.sourceUrl}
+                              href={safeExternalHref(m.sourceUrl)}
                               target="_blank"
-                              rel="noreferrer"
+                              rel="noopener noreferrer"
                               className="inline-flex items-center gap-1 text-[#20C5D5] hover:underline shrink-0"
                             >
                               <span>Portal</span>
@@ -4152,18 +4489,22 @@ export const BetaWorkspace: React.FC = () => {
                 <p className="text-[var(--text-secondary)]">{discoveredSummary}</p>
                 {discoveredMapsLinks.length > 0 && (
                   <div className="flex flex-wrap gap-2 pt-1">
-                    {discoveredMapsLinks.map((lnk) => (
-                      <a
-                        key={lnk.uri}
-                        href={lnk.uri}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="inline-flex items-center gap-1 rounded-md border border-[var(--border-subtle)] bg-[var(--bg-card-secondary)] px-2.5 py-1 text-[11px] text-[#20C5D5] hover:border-[#20C5D5]"
-                      >
-                        <ExternalLink className="h-3 w-3" />
-                        <span>{lnk.title}</span>
-                      </a>
-                    ))}
+                    {discoveredMapsLinks.map((lnk) => {
+                      const safeHref = safeExternalHref(lnk.uri);
+                      if (!safeHref) return null;
+                      return (
+                        <a
+                          key={safeHref}
+                          href={safeHref}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 rounded-md border border-[var(--border-subtle)] bg-[var(--bg-card-secondary)] px-2.5 py-1 text-[11px] text-[#20C5D5] hover:border-[#20C5D5]"
+                        >
+                          <ExternalLink className="h-3 w-3" />
+                          <span>{lnk.title}</span>
+                        </a>
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -4304,11 +4645,11 @@ export const BetaWorkspace: React.FC = () => {
 
                         <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-[var(--border-subtle)] text-[11px] text-[var(--text-secondary)]">
                           <span>Consultado em: {dossier.consultedAt || 'Atual'}</span>
-                          {c.sourceUrl && (
+                          {safeExternalHref(c.sourceUrl) && (
                             <a
-                              href={c.sourceUrl}
+                              href={safeExternalHref(c.sourceUrl)}
                               target="_blank"
-                              rel="noreferrer"
+                              rel="noopener noreferrer"
                               className="inline-flex items-center gap-1 text-[#20C5D5] hover:underline"
                             >
                               <ExternalLink className="h-3 w-3" />
@@ -4373,11 +4714,11 @@ export const BetaWorkspace: React.FC = () => {
                         potentialImpact={s.impactNote || (s.priority === 'alta' ? 'Impacto alto' : 'Impacto médio')}
                         recommendation={meta.recommendation || 'Avaliar reação comercial e posicionamento de preço.'}
                         footerActions={
-                          meta.sourceUrl ? (
+                          meta.sourceUrl && safeExternalHref(meta.sourceUrl) ? (
                             <a
-                              href={meta.sourceUrl}
+                              href={safeExternalHref(meta.sourceUrl)}
                               target="_blank"
-                              rel="noreferrer"
+                              rel="noopener noreferrer"
                               className="inline-flex items-center gap-1 rounded-lg border border-[var(--border-subtle)] px-2.5 py-1 text-[11px] text-[#20C5D5] hover:border-[#20C5D5]"
                             >
                               <ExternalLink className="h-3 w-3" />
@@ -5719,81 +6060,577 @@ export const BetaWorkspace: React.FC = () => {
       })()}
 
       {/* ================================================================ */}
-      {/* ASSISTENTE DE INTELIGÊNCIA FULL-PAGE (PDF 2 p.13 + Gemini real)   */}
+      {/* GÊMEO DIGITAL AI — MÓDULO CENTRAL DE INTELIGÊNCIA EMPRESARIAL    */}
       {/* ================================================================ */}
-      {section === 'assistente' && (
-        <div className="space-y-5">
-          <PageHeader
-            kicker="ESTRATÉGIA E DECISÃO"
-            title="Assistente de inteligência"
-            description="Pergunte sobre os dados internos da sua empresa, macroeconomia oficial e estratégia."
-          />
+      {section === 'assistente' && (() => {
+        const renderedAiMessages = firebaseUser
+          ? aiChatMessages.map((m) => ({
+              id: m.id,
+              role: m.role,
+              content: m.content,
+              toolUsed: m.toolUsed,
+              sourcesUsed: m.sourcesUsed,
+              groundingLinks: m.groundingLinks,
+            }))
+          : fullAiMessages.map((m, i) => ({
+              id: `mem_${i}`,
+              role: m.role,
+              content: m.content,
+              toolUsed: m.toolUsed,
+              sourcesUsed: m.sourcesUsed,
+              groundingLinks: m.groundingLinks,
+            }));
 
-          <div className="rounded-xl border border-[#F2B84B]/30 bg-[#F2B84B]/10 px-4 py-2.5 text-xs text-[#F2B84B]">
-            Respostas geradas via Gemini AI usando exclusivamente os registros cadastrados da {workspace.company.name} e fontes oficiais (BCB/IBGE). Não substitui aconselhamento jurídico, contábil ou tributário.
-          </div>
+        const availLabel =
+          aiStatus?.availability === 'unconfigured'
+            ? 'Chave não configurada'
+            : aiStatus?.availability === 'degraded'
+              ? 'Degradado'
+              : 'Online';
 
-          <div className="flex flex-wrap gap-2">
-            {[
-              'Qual a Qualidade do Cruzamento atual da minha empresa e o que falta preencher?',
-              'Como a Selic e o IPCA atuais impactam nossos produtos cadastrados?',
-              'Quais riscos competitivos merecem decisão imediata?',
-              'Faça um resumo executivo da situação atual da empresa.',
-            ].map((q) => (
-              <button
-                key={q}
-                type="button"
-                onClick={() => askFullAssistant(q)}
-                className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-card)] px-3 py-1.5 text-xs hover:border-[#20C5D5] cursor-pointer"
-              >
-                {q}
-              </button>
-            ))}
-          </div>
-
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              askFullAssistant(fullAiInput);
-            }}
-            className="flex gap-2"
-          >
-            <input
-              type="text"
-              value={fullAiInput}
-              onChange={(e) => setFullAiInput(e.target.value)}
-              placeholder="Faça uma pergunta sobre sua empresa..."
-              className="flex-1 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-card)] px-4 py-3 text-xs text-[var(--text-primary)] focus:outline-none focus:border-[#20C5D5]"
+        return (
+          <div className="space-y-5">
+            <PageHeader
+              kicker="MÓDULO CENTRAL · INTELIGÊNCIA MULTISSETORIAL"
+              title="Gêmeo Digital AI"
+              description={`Inteligência oficial Google Gemini integrada aos dados reais da ${workspace.company.name}, pesquisa web, Google Maps, leitura de documentos/planilhas e execução autorizada de ações.`}
+              actions={
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowAiHistory((v) => !v)}
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-card)] px-3 py-2 text-xs font-medium text-[var(--text-primary)] hover:border-[#20C5D5] cursor-pointer"
+                  >
+                    <History className="h-3.5 w-3.5 text-[#20C5D5]" />
+                    <span>Histórico ({aiChats.length})</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleNewAiChat()}
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-card)] px-3 py-2 text-xs font-medium text-[var(--text-primary)] hover:border-[#20C5D5] cursor-pointer"
+                  >
+                    <MessageSquarePlus className="h-3.5 w-3.5 text-[#20C5D5]" />
+                    <span>Nova conversa</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={generatingAiReport}
+                    onClick={() => void handleGenerateAiExecutiveReport()}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-[#20C5D5] px-4 py-2 text-xs font-semibold text-[#06132D] hover:bg-[#38d3e2] cursor-pointer disabled:opacity-60"
+                  >
+                    {generatingAiReport ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Sparkles className="h-3.5 w-3.5" />
+                    )}
+                    <span>{generatingAiReport ? 'Gerando diagnóstico...' : 'Gerar Diagnóstico Executivo IA'}</span>
+                  </button>
+                </div>
+              }
             />
-            <button
-              type="submit"
-              disabled={fullAiLoading}
-              className="inline-flex items-center gap-1.5 rounded-xl bg-[#F4F8FF] px-5 py-3 text-xs font-semibold text-[#06132D] hover:bg-white cursor-pointer disabled:opacity-60"
-            >
-              {fullAiLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
-              <span>Perguntar</span>
-            </button>
-          </form>
 
-          {(fullAiMessages.length > 0 || fullAiLoading) && (
-            <div className="space-y-3">
-              {fullAiMessages.map((m, idx) => (
-                <div
-                  key={idx}
-                  className={`rounded-xl border p-4 text-xs leading-relaxed whitespace-pre-wrap ${
-                    m.role === 'user' ? 'border-[#20C5D5]/40 bg-[#15365F]' : 'border-[var(--border-subtle)] bg-[var(--bg-card)]'
-                  }`}
+            {/* Monitoring, Quota & RBAC Telemetry Strip */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+              <KpiStatCard
+                title="Motor Gêmeo Digital AI"
+                value={aiStatusLoading && !aiStatus ? 'Verificando...' : availLabel}
+                subtitle={aiStatus?.model || 'gemini-4-hydrogen'}
+                tone={aiStatus?.availability === 'online' ? 'cyan' : 'amber'}
+                icon={Bot}
+              />
+              <KpiStatCard
+                title="Uso Diário da Empresa"
+                value={aiStatus ? `${aiStatus.dailyUsed} / ${aiStatus.dailyLimit}` : '—'}
+                subtitle={
+                  aiStatus
+                    ? `${aiStatus.remainingToday} restantes · Plano ${aiStatus.planName}`
+                    : 'Limite diário por plano'
+                }
+                tone="green"
+                icon={Activity}
+              />
+              <KpiStatCard
+                title="Latência & Sucesso (24h)"
+                value={aiStatus ? `${aiStatus.avgLatencyMs} ms` : '—'}
+                subtitle={
+                  aiStatus
+                    ? `${aiStatus.successCount24h} sucesso · ${aiStatus.errorCount24h} falhas`
+                    : 'Telemetria em tempo real'
+                }
+                tone="default"
+                icon={RefreshCw}
+              />
+              <KpiStatCard
+                title="Autorizações & Papel"
+                value={`${aiPendingProposals.length} pendente(s)`}
+                subtitle={
+                  aiStatus?.canAuthorizeActions === false
+                    ? `Papel ${aiStatus.userRole} (somente leitura)`
+                    : `Papel ${aiStatus?.userRole || 'owner'} · Execução via confirmação`
+                }
+                tone={aiPendingProposals.length > 0 ? 'amber' : 'default'}
+                icon={ShieldCheck}
+              />
+            </div>
+
+            {aiDegradedBanner && (
+              <div className="rounded-xl border border-[#EF6464]/45 bg-[#EF6464]/10 px-4 py-3 text-xs text-[#EF6464] flex items-start justify-between gap-3">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+                  <span>{aiDegradedBanner}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setAiDegradedBanner('')}
+                  className="hover:text-white cursor-pointer shrink-0"
                 >
-                  <div className="font-semibold text-[11px] uppercase tracking-wider text-[#20C5D5] mb-1">
-                    {m.role === 'user' ? 'Você' : `Assistente IA · ${workspace.company.name}`}
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            )}
+
+            <div className="rounded-xl border border-[#F2B84B]/30 bg-[#F2B84B]/10 px-4 py-2.5 text-xs text-[#F2B84B]">
+              Isolamento multi-tenant ativo: o Gêmeo Digital AI consulta exclusivamente os dados da {workspace.company.name} no Cloud SQL, indicadores oficiais (BCB/IBGE/SEFAZ), Google Maps e Busca Google. Nenhuma alteração interna ocorre sem sua autorização explícita.
+            </div>
+
+            {/* Per-company Firestore History Drawer */}
+            {firebaseUser && showAiHistory && (
+              <div className="rounded-2xl border border-[var(--border-subtle)] bg-[var(--bg-card)] p-4 space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <div className="text-xs font-semibold text-[var(--text-primary)]">
+                    Histórico salvo desta empresa ({workspace.company.name})
                   </div>
-                  <p>{m.content}</p>
-                  {m.groundingLinks && m.groundingLinks.length > 0 && (
-                    <div className="mt-2 pt-2 border-t border-[var(--border-subtle)] flex flex-wrap gap-1.5">
-                      {m.groundingLinks.map((lnk, lIdx) => (
+                  <button
+                    type="button"
+                    onClick={() => void handleNewAiChat()}
+                    className="text-xs font-semibold text-[#20C5D5] hover:underline cursor-pointer"
+                  >
+                    + Iniciar nova thread
+                  </button>
+                </div>
+                {aiChats.length === 0 ? (
+                  <p className="text-xs text-[var(--text-secondary)]">
+                    Nenhuma conversa salva ainda para {workspace.company.name}. Envie uma pergunta abaixo para iniciar.
+                  </p>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+                    {aiChats.map((c) => (
+                      <div
+                        key={c.id}
+                        className={`flex items-center justify-between gap-2 rounded-xl border px-3 py-2 text-xs transition-colors ${
+                          c.id === activeAiChatId
+                            ? 'border-[#20C5D5]/50 bg-[#15365F] text-white'
+                            : 'border-[var(--border-subtle)] bg-[var(--bg-sidebar)] text-[var(--text-secondary)] hover:border-[#20C5D5]/30'
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setActiveAiChatId(c.id);
+                            setShowAiHistory(false);
+                          }}
+                          className="flex-1 text-left min-w-0 cursor-pointer"
+                        >
+                          <div className="font-semibold truncate text-[var(--text-primary)]">{c.title}</div>
+                          <div className="text-[11px] opacity-75 truncate">
+                            {c.messageCount} msgs · {c.lastMessagePreview || 'Sem mensagens'}
+                          </div>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleDeleteAiChat(c.id)}
+                          className="p-1 text-[var(--text-secondary)] hover:text-[#EF6464] cursor-pointer shrink-0"
+                          aria-label="Excluir conversa"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* User-Authorized Action Proposals Panel */}
+            {aiPendingProposals.length > 0 && (
+              <div className="rounded-2xl border border-[#F2B84B]/50 bg-[#F2B84B]/10 p-4 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-[#F2B84B]">
+                    <ShieldAlert className="h-4 w-4 shrink-0" />
+                    <span>Ações Internas Aguardando Sua Autorização ({aiPendingProposals.length})</span>
+                  </div>
+                  {aiStatus?.canAuthorizeActions === false && (
+                    <span className="text-[11px] text-[#EF6464]">
+                      Papel viewer: somente leitura (peça a um editor/owner para aprovar)
+                    </span>
+                  )}
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {aiPendingProposals.map((prop) => (
+                    <div
+                      key={prop.proposalToken}
+                      className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-card)] p-3.5 space-y-2 text-xs"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-bold text-[var(--text-primary)]">{prop.title}</span>
+                        <span className="rounded bg-[#102B50] px-2 py-0.5 text-[10px] font-mono text-[#20C5D5]">
+                          {prop.functionName}
+                        </span>
+                      </div>
+                      <p className="text-[var(--text-secondary)] leading-relaxed">{prop.summary}</p>
+                      <div className="rounded-lg bg-[var(--bg-sidebar)] border border-[var(--border-subtle)] p-2 text-[11px] font-mono text-[var(--text-secondary)] overflow-x-auto">
+                        {JSON.stringify(prop.args)}
+                      </div>
+                      <div className="flex items-center justify-between gap-2 pt-1">
+                        <span className="text-[10px] text-[var(--text-secondary)]">
+                          Expira: {new Date(prop.expiresAt).toLocaleTimeString('pt-BR')}
+                        </span>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            disabled={
+                              resolvingProposalToken === prop.proposalToken ||
+                              aiStatus?.canAuthorizeActions === false
+                            }
+                            onClick={() => void handleResolveAiProposal(prop.proposalToken, 'approve')}
+                            className="inline-flex items-center gap-1 rounded-lg bg-[#20B981] px-3 py-1.5 text-[11px] font-bold text-[#06132D] hover:opacity-90 cursor-pointer disabled:opacity-50"
+                          >
+                            <CheckCircle2 className="h-3.5 w-3.5" />
+                            <span>
+                              {resolvingProposalToken === prop.proposalToken
+                                ? 'Executando...'
+                                : 'Autorizar e Executar'}
+                            </span>
+                          </button>
+                          <button
+                            type="button"
+                            disabled={
+                              resolvingProposalToken === prop.proposalToken ||
+                              aiStatus?.canAuthorizeActions === false
+                            }
+                            onClick={() => void handleResolveAiProposal(prop.proposalToken, 'reject')}
+                            className="rounded-lg border border-[var(--border-subtle)] px-3 py-1.5 text-[11px] text-[var(--text-secondary)] hover:text-white cursor-pointer disabled:opacity-50"
+                          >
+                            Cancelar
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Quick Prompts */}
+            <div className="flex flex-wrap gap-2">
+              {[
+                'Faça um diagnóstico completo cruzando finanças, estoque, concorrência e consumidores.',
+                'Quais são os concorrentes e oportunidades na região via Google Maps?',
+                'Pesquise tendências atuais na internet para o nosso setor no Brasil hoje.',
+                'Sugira um plano de ação prioritário para elevar nossa margem operacional (aguardando minha aprovação).',
+              ].map((q) => (
+                <button
+                  key={q}
+                  type="button"
+                  onClick={() => void askFullAssistant(q)}
+                  className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-card)] px-3 py-1.5 text-xs hover:border-[#20C5D5] cursor-pointer text-left"
+                >
+                  {q}
+                </button>
+              ))}
+            </div>
+
+            {/* Multimodal Attachment Chip */}
+            {aiAttachment && (
+              <div className="rounded-xl border border-[#20C5D5]/40 bg-[#102B50] px-4 py-2 text-xs text-[#20C5D5] flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <FileText className="h-4 w-4 shrink-0" />
+                  <span className="truncate font-medium">
+                    Arquivo anexado: {aiAttachment.fileName} (
+                    {Math.max(1, Math.round(aiAttachment.sizeBytes / 1024))} KB)
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setAiAttachment(null)}
+                  className="text-[var(--text-secondary)] hover:text-white cursor-pointer"
+                  aria-label="Remover arquivo anexo"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            )}
+
+            {/* Chat Form with Multimodal Upload */}
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                void askFullAssistant(fullAiInput);
+              }}
+              className="flex flex-wrap sm:flex-nowrap gap-2"
+            >
+              <input
+                ref={aiAttachmentInputRef}
+                type="file"
+                accept=".pdf,.xlsx,.xls,.csv,.txt,.png,.jpg,.jpeg,.webp"
+                onChange={handlePickAiAttachment}
+                className="hidden"
+              />
+              <button
+                type="button"
+                disabled={fullAiLoading}
+                onClick={() => aiAttachmentInputRef.current?.click()}
+                title="Anexar PDF, planilha Excel/CSV ou imagem para leitura pela IA (máx. 6 MB)"
+                className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-card)] px-3.5 py-3 text-xs font-medium text-[var(--text-primary)] hover:border-[#20C5D5] cursor-pointer disabled:opacity-60"
+              >
+                <Paperclip className="h-3.5 w-3.5 text-[#20C5D5]" />
+                <span>Anexar PDF/Planilha</span>
+              </button>
+              <input
+                type="text"
+                value={fullAiInput}
+                onChange={(e) => setFullAiInput(e.target.value)}
+                placeholder={
+                  aiAttachment
+                    ? 'Descreva o que o Gêmeo Digital AI deve analisar neste arquivo...'
+                    : 'Pergunte sobre finanças, produtos, concorrência, Maps, web ou peça uma proposta de ação...'
+                }
+                className="flex-1 min-w-[220px] rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-card)] px-4 py-3 text-xs text-[var(--text-primary)] focus:outline-none focus:border-[#20C5D5]"
+              />
+              <button
+                type="submit"
+                disabled={fullAiLoading || (!fullAiInput.trim() && !aiAttachment)}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-[#F4F8FF] px-5 py-3 text-xs font-semibold text-[#06132D] hover:bg-white cursor-pointer disabled:opacity-60"
+              >
+                {fullAiLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
+                <span>Enviar</span>
+              </button>
+            </form>
+
+            {/* Conversation Messages */}
+            {(renderedAiMessages.length > 0 || fullAiLoading) && (
+              <div className="space-y-3">
+                {renderedAiMessages.map((m) => (
+                  <div
+                    key={m.id}
+                    className={`rounded-xl border p-4 text-xs leading-relaxed whitespace-pre-wrap ${
+                      m.role === 'user'
+                        ? 'border-[#20C5D5]/40 bg-[#15365F] text-white'
+                        : 'border-[var(--border-subtle)] bg-[var(--bg-card)]'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2 mb-1">
+                      <span className="font-semibold text-[11px] uppercase tracking-wider text-[#20C5D5]">
+                        {m.role === 'user' ? 'Você' : `Gêmeo Digital AI · ${workspace.company.name}`}
+                      </span>
+                      {m.role === 'assistant' && m.toolUsed && (
+                        <span className="rounded bg-[#102B50] px-2 py-0.5 text-[10px] font-semibold text-[#20C5D5]">
+                          {m.toolUsed === 'maps'
+                            ? 'Google Maps'
+                            : m.toolUsed === 'search'
+                              ? 'Busca Google'
+                              : m.toolUsed === 'cloudsql'
+                                ? 'Cloud SQL + Ferramentas'
+                                : 'Gemini IA'}
+                        </span>
+                      )}
+                    </div>
+                    <p>{m.content}</p>
+                    {m.groundingLinks && m.groundingLinks.length > 0 && (
+                      <div className="mt-2 pt-2 border-t border-[var(--border-subtle)] flex flex-wrap gap-1.5">
+                        {m.groundingLinks.map((lnk, lIdx) => {
+                          const safeHref = safeExternalHref(lnk.uri);
+                          if (!safeHref) return null;
+                          return (
+                            <a
+                              key={lIdx}
+                              href={safeHref}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 rounded border border-[#20C5D5]/30 bg-[#20C5D5]/10 px-2 py-0.5 text-[11px] text-[#20C5D5] hover:underline"
+                            >
+                              <ExternalLink className="h-3 w-3" />
+                              <span>{lnk.title}</span>
+                            </a>
+                          );
+                        })}
+                      </div>
+                    )}
+                    {m.sourcesUsed && m.sourcesUsed.length > 0 && (
+                      <div className="mt-2 pt-2 border-t border-[var(--border-subtle)] text-[11px] text-[var(--text-secondary)]">
+                        Fontes consultadas: {m.sourcesUsed.join(' · ')}
+                      </div>
+                    )}
+                  </div>
+                ))}
+                {fullAiLoading && (
+                  <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-card)] p-4 text-xs flex items-center gap-2 text-[#20C5D5]">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    <span>digitando... consultando ferramentas e dados reais da empresa</span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Structured Executive AI Report Output + PDF Export */}
+            {aiExecutiveReport && (
+              <div className="rounded-2xl border border-[#20C5D5]/40 bg-[var(--bg-card)] p-5 space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--border-subtle)] pb-3">
+                  <div>
+                    <div className="text-[11px] font-bold uppercase tracking-wider text-[#20C5D5]">
+                      Diagnóstico Executivo Consolidado · {aiExecutiveReport.segment} ({aiExecutiveReport.cityState})
+                    </div>
+                    <h3 className="text-base font-bold text-[var(--text-primary)] mt-0.5">
+                      {aiExecutiveReport.companyName}
+                    </h3>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => exportAiExecutiveReportPDF(aiExecutiveReport)}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-[#F4F8FF] px-3.5 py-2 text-xs font-semibold text-[#06132D] hover:bg-white cursor-pointer"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    <span>Exportar PDF Executivo IA</span>
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 text-xs">
+                  <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-sidebar)] p-4 space-y-2">
+                    <div className="font-bold text-[#20C5D5]">Resumo Executivo & Setor</div>
+                    <p className="text-[var(--text-primary)] leading-relaxed">{aiExecutiveReport.executiveSummary}</p>
+                    {aiExecutiveReport.sectorContext && (
+                      <p className="text-[var(--text-secondary)] leading-relaxed">{aiExecutiveReport.sectorContext}</p>
+                    )}
+                  </div>
+
+                  <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-sidebar)] p-4 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold text-[#20B981]">Saúde Financeira</span>
+                      <StatusBadge
+                        kind="recomendacao"
+                        customLabel={aiExecutiveReport.financialHealth.statusLabel}
+                      />
+                    </div>
+                    <p className="text-[var(--text-primary)] leading-relaxed">
+                      {aiExecutiveReport.financialHealth.summary}
+                    </p>
+                    {aiExecutiveReport.financialHealth.keyNumbers.length > 0 && (
+                      <ul className="list-disc pl-4 space-y-1 text-[var(--text-secondary)]">
+                        {aiExecutiveReport.financialHealth.keyNumbers.map((num, idx) => (
+                          <li key={idx}>{num}</li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+
+                  <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-sidebar)] p-4 space-y-2">
+                    <div className="font-bold text-[#F2B84B]">Posição Competitiva</div>
+                    <p className="text-[var(--text-primary)] leading-relaxed">
+                      {aiExecutiveReport.competitivePosition.summary}
+                    </p>
+                    {aiExecutiveReport.competitivePosition.advantages.length > 0 && (
+                      <div className="text-[#20B981] space-y-0.5">
+                        {aiExecutiveReport.competitivePosition.advantages.map((a, i) => (
+                          <div key={i}>+ {a}</div>
+                        ))}
+                      </div>
+                    )}
+                    {aiExecutiveReport.competitivePosition.vulnerabilities.length > 0 && (
+                      <div className="text-[#EF6464] space-y-0.5">
+                        {aiExecutiveReport.competitivePosition.vulnerabilities.map((v, i) => (
+                          <div key={i}>- {v}</div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-sidebar)] p-4 space-y-2">
+                    <div className="font-bold text-[#20C5D5]">Diagnóstico dos Consumidores</div>
+                    <p className="text-[var(--text-primary)] leading-relaxed">
+                      {aiExecutiveReport.consumerDiagnosis.summary}
+                    </p>
+                    {aiExecutiveReport.consumerDiagnosis.strengths.length > 0 && (
+                      <div className="text-[#20B981] space-y-0.5">
+                        {aiExecutiveReport.consumerDiagnosis.strengths.map((s, i) => (
+                          <div key={i}>Elogio: {s}</div>
+                        ))}
+                      </div>
+                    )}
+                    {aiExecutiveReport.consumerDiagnosis.painPoints.length > 0 && (
+                      <div className="text-[#F2B84B] space-y-0.5">
+                        {aiExecutiveReport.consumerDiagnosis.painPoints.map((p, i) => (
+                          <div key={i}>Ponto de atenção: {p}</div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {(aiExecutiveReport.opportunities.length > 0 || aiExecutiveReport.risks.length > 0) && (
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 text-xs">
+                    <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-sidebar)] p-4 space-y-2">
+                      <div className="font-bold text-[#20B981]">Oportunidades Identificadas</div>
+                      {aiExecutiveReport.opportunities.map((op, i) => (
+                        <div key={i} className="border-t border-[var(--border-subtle)] pt-2 first:border-0 first:pt-0">
+                          <div className="font-semibold text-[var(--text-primary)]">
+                            {op.title} <span className="text-[#20B981]">({op.impact})</span>
+                          </div>
+                          <div className="text-[var(--text-secondary)]">{op.action}</div>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-sidebar)] p-4 space-y-2">
+                      <div className="font-bold text-[#EF6464]">Riscos & Mitigação</div>
+                      {aiExecutiveReport.risks.map((rk, i) => (
+                        <div key={i} className="border-t border-[var(--border-subtle)] pt-2 first:border-0 first:pt-0">
+                          <div className="font-semibold text-[var(--text-primary)]">
+                            {rk.title} <span className="text-[#EF6464]">({rk.severity})</span>
+                          </div>
+                          <div className="text-[var(--text-secondary)]">{rk.mitigation}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {aiExecutiveReport.strategicRecommendations.length > 0 && (
+                  <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-sidebar)] p-4 space-y-2 text-xs">
+                    <div className="font-bold text-[#20C5D5]">Recomendações Estratégicas Prioritárias</div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                      {aiExecutiveReport.strategicRecommendations.map((rec, i) => (
+                        <div key={i} className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-card)] p-3 space-y-1">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-semibold text-[var(--text-primary)]">{rec.title}</span>
+                            <span className="text-[10px] uppercase font-bold text-[#F2B84B]">{rec.priority}</span>
+                          </div>
+                          <p className="text-[var(--text-secondary)]">{rec.rationale}</p>
+                          <div className="text-[11px] text-[#20C5D5]">KPI sugerido: {rec.suggestedKpi}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {aiExecutiveReport.dataGaps.length > 0 && (
+                  <div className="rounded-xl border border-[#F2B84B]/30 bg-[#F2B84B]/10 p-3.5 text-xs space-y-1">
+                    <div className="font-bold text-[#F2B84B]">Lacunas de Dados Identificadas</div>
+                    <ul className="list-disc pl-4 space-y-0.5 text-[var(--text-primary)]">
+                      {aiExecutiveReport.dataGaps.map((g, i) => (
+                        <li key={i}>{g}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {aiExecutiveReport.groundingLinks && aiExecutiveReport.groundingLinks.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 pt-1">
+                    {aiExecutiveReport.groundingLinks.map((lnk, i) => {
+                      const safeHref = safeExternalHref(lnk.uri);
+                      if (!safeHref) return null;
+                      return (
                         <a
-                          key={lIdx}
-                          href={lnk.uri}
+                          key={i}
+                          href={safeHref}
                           target="_blank"
                           rel="noopener noreferrer"
                           className="inline-flex items-center gap-1 rounded border border-[#20C5D5]/30 bg-[#20C5D5]/10 px-2 py-0.5 text-[11px] text-[#20C5D5] hover:underline"
@@ -5801,26 +6638,67 @@ export const BetaWorkspace: React.FC = () => {
                           <ExternalLink className="h-3 w-3" />
                           <span>{lnk.title}</span>
                         </a>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Recent AI Calls Telemetry Log */}
+            {aiStatus && aiStatus.recentCalls.length > 0 && (
+              <div className="rounded-2xl border border-[var(--border-subtle)] bg-[var(--bg-card)] p-4 space-y-2.5">
+                <div className="flex items-center justify-between text-xs font-semibold text-[var(--text-primary)]">
+                  <span>Monitoramento de Execuções Recentes (Últimas 24h)</span>
+                  <button
+                    type="button"
+                    onClick={() => void loadAiStatus()}
+                    className="inline-flex items-center gap-1 text-[11px] text-[#20C5D5] hover:underline cursor-pointer"
+                  >
+                    <RefreshCw className="h-3 w-3" />
+                    <span>Atualizar</span>
+                  </button>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-[11px]">
+                    <thead className="text-[var(--text-secondary)] border-b border-[var(--border-subtle)]">
+                      <tr>
+                        <th className="py-1.5 pr-3">Módulo</th>
+                        <th className="py-1.5 pr-3">Ferramenta</th>
+                        <th className="py-1.5 pr-3">Status</th>
+                        <th className="py-1.5 pr-3">Latência</th>
+                        <th className="py-1.5">Horário</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[var(--border-subtle)]">
+                      {aiStatus.recentCalls.slice(0, 6).map((call) => (
+                        <tr key={call.id}>
+                          <td className="py-1.5 pr-3 font-medium text-[var(--text-primary)]">{call.module}</td>
+                          <td className="py-1.5 pr-3 text-[var(--text-secondary)]">{call.toolUsed}</td>
+                          <td className="py-1.5 pr-3">
+                            <span
+                              className={
+                                call.status === 'success' ? 'text-[#20B981]' : 'text-[#EF6464]'
+                              }
+                            >
+                              {call.status}
+                              {call.errorCode ? ` (${call.errorCode})` : ''}
+                            </span>
+                          </td>
+                          <td className="py-1.5 pr-3 text-[var(--text-secondary)]">{call.latencyMs} ms</td>
+                          <td className="py-1.5 text-[var(--text-secondary)]">
+                            {new Date(call.createdAt).toLocaleTimeString('pt-BR')}
+                          </td>
+                        </tr>
                       ))}
-                    </div>
-                  )}
-                  {m.sourcesUsed && m.sourcesUsed.length > 0 && (
-                    <div className="mt-2 pt-2 border-t border-[var(--border-subtle)] text-[11px] text-[var(--text-secondary)]">
-                      Fontes consultadas: {m.sourcesUsed.join(' · ')}
-                    </div>
-                  )}
+                    </tbody>
+                  </table>
                 </div>
-              ))}
-              {fullAiLoading && (
-                <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-card)] p-4 text-xs flex items-center gap-2 text-[var(--text-secondary)]">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin text-[#20C5D5]" />
-                  <span>digitando...</span>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      )}
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {/* ================================================================ */}
       {/* RELATÓRIOS (8 seções consolidadas) & INDICADORES (3 grupos+Macro)*/}

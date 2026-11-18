@@ -1,8 +1,12 @@
 import { and, eq } from 'drizzle-orm';
 import { db } from '../db/index.ts';
 import { auditLogs, companies, companyMembers } from '../db/schema.ts';
+import { recordSecurityEvent } from '../server/securityLogger.ts';
 
 export async function getUserCompanyAccess(userId: number, companyId: number) {
+  if (!Number.isInteger(userId) || userId <= 0 || !Number.isInteger(companyId) || companyId <= 0) {
+    return null;
+  }
   try {
     const [company] = await db
       .select()
@@ -29,13 +33,20 @@ export async function getUserCompanyAccess(userId: number, companyId: number) {
       );
 
     if (!membership) {
+      void recordSecurityEvent({
+        eventType: 'TENANT_FORBIDDEN',
+        severity: 'high',
+        userId,
+        companyId,
+        details: { reason: 'CROSS_TENANT_ACCESS_DENIED' },
+      });
       return null;
     }
 
     return { company, role: membership.role as 'owner' | 'admin' | 'editor' | 'viewer' };
   } catch (error) {
-    console.error('Database query failed in getUserCompanyAccess:', error);
-    throw new Error('Erro ao validar permissões da empresa.', { cause: error });
+    console.error('Database query failed in getUserCompanyAccess:', error instanceof Error ? error.message : 'unknown');
+    throw new Error('Erro ao validar permissões da empresa.');
   }
 }
 

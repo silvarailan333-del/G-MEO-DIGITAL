@@ -478,6 +478,74 @@ export const inventoryControlItems = pgTable('inventory_control_items', {
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
 
+export const securityEvents = pgTable('security_events', {
+  id: serial('id').primaryKey(),
+  eventType: text('event_type').notNull(), // WAF_BLOCK | SQLI_PROBE | XSS_PROBE | SSRF_ATTEMPT | PATH_TRAVERSAL | RATE_LIMIT | BOT_BLOCKED | AUTH_INVALID | TENANT_FORBIDDEN | UPLOAD_REJECTED | CSRF_MISMATCH | SCANNER_PROBE
+  severity: text('severity').default('medium').notNull(), // low | medium | high | critical
+  ipHash: text('ip_hash').default('').notNull(),
+  method: text('method').default('').notNull(),
+  path: text('path').default('').notNull(),
+  userId: integer('user_id').references(() => users.id, { onDelete: 'set null' }),
+  companyId: integer('company_id').references(() => companies.id, { onDelete: 'set null' }),
+  cfRay: text('cf_ray').default('').notNull(),
+  cfCountry: text('cf_country').default('').notNull(),
+  userAgent: text('user_agent').default('').notNull(),
+  blocked: boolean('blocked').default(true).notNull(),
+  detailsJson: jsonb('details_json').default({}).notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const backupSnapshots = pgTable('backup_snapshots', {
+  id: serial('id').primaryKey(),
+  fileName: text('file_name').notNull(),
+  triggerType: text('trigger_type').default('scheduled').notNull(), // scheduled | manual | company_export
+  companyId: integer('company_id').references(() => companies.id, { onDelete: 'set null' }),
+  integritySha256: text('integrity_sha256').notNull(),
+  sizeBytes: integer('size_bytes').default(0).notNull(),
+  recordCountsJson: jsonb('record_counts_json').default({}).notNull(),
+  status: text('status').default('verified').notNull(), // verified | failed
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const aiUsageLogs = pgTable('ai_usage_logs', {
+  id: serial('id').primaryKey(),
+  companyId: integer('company_id').references(() => companies.id, { onDelete: 'cascade' }),
+  userId: integer('user_id').references(() => users.id, { onDelete: 'set null' }),
+  module: text('module').default('gemeo_ai_chat').notNull(),
+  model: text('model').default('gemini-4-hydrogen').notNull(),
+  toolUsed: text('tool_used').default('general').notNull(),
+  status: text('status').default('success').notNull(), // success | degraded | quota_exceeded | error
+  latencyMs: integer('latency_ms').default(0).notNull(),
+  inputChars: integer('input_chars').default(0).notNull(),
+  outputChars: integer('output_chars').default(0).notNull(),
+  errorCode: text('error_code').default('').notNull(),
+  errorMessage: text('error_message').default('').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const aiActionProposals = pgTable('ai_action_proposals', {
+  id: serial('id').primaryKey(),
+  proposalToken: text('proposal_token').notNull().unique(),
+  companyId: integer('company_id')
+    .references(() => companies.id, { onDelete: 'cascade' })
+    .notNull(),
+  userId: integer('user_id')
+    .references(() => users.id, { onDelete: 'cascade' })
+    .notNull(),
+  functionName: text('function_name').notNull(),
+  title: text('title').notNull(),
+  summary: text('summary').default('').notNull(),
+  argsJson: jsonb('args_json').default({}).notNull(),
+  status: text('status').default('pending').notNull(), // pending | executed | rejected | expired
+  resultJson: jsonb('result_json').default({}).notNull(),
+  approvedByUserId: integer('approved_by_user_id').references(() => users.id, {
+    onDelete: 'set null',
+  }),
+  expiresAt: timestamp('expires_at').notNull(),
+  resolvedAt: timestamp('resolved_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
 export const usersRelations = relations(users, ({ many }) => ({
   ownedCompanies: many(companies),
   memberships: many(companyMembers),
@@ -509,4 +577,6 @@ export const companiesRelations = relations(companies, ({ one, many }) => ({
   financialCostRecords: many(financialCostRecords),
   financialExpenseRecords: many(financialExpenseRecords),
   inventoryControlItems: many(inventoryControlItems),
+  aiUsageLogs: many(aiUsageLogs),
+  aiActionProposals: many(aiActionProposals),
 }));

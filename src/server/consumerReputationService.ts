@@ -321,7 +321,12 @@ export async function captureReclameAquiProfile(params: {
     };
   }
 
-  if (!parsedUrl.hostname.toLowerCase().includes('reclameaqui.com.br')) {
+  const host = parsedUrl.hostname.toLowerCase();
+  const isOfficialReclameAqui =
+    (parsedUrl.protocol === 'https:' || parsedUrl.protocol === 'http:') &&
+    (host === 'reclameaqui.com.br' || host.endsWith('.reclameaqui.com.br'));
+
+  if (!isOfficialReclameAqui) {
     return {
       validUrl: false,
       normalizedUrl: cleanUrl,

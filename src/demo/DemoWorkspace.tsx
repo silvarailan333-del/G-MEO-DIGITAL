@@ -78,6 +78,7 @@ import {
   PLANS_CONFIG,
   type PlanCode,
 } from '../config/plans';
+import { safeExternalHref } from '../lib/safeUrl';
 import {
   AppShell,
   KpiStatCard,
@@ -2317,11 +2318,11 @@ export const DemoWorkspace: React.FC<{ initialSection?: string }> = ({
                 </div>
                 <div className="pt-2 border-t border-[var(--border-subtle)] flex items-center justify-between gap-2 text-[10px] text-[var(--text-secondary)]">
                   <span className="truncate">{m.source}</span>
-                  {m.sourceUrl && (
+                  {safeExternalHref(m.sourceUrl) && (
                     <a
-                      href={m.sourceUrl}
+                      href={safeExternalHref(m.sourceUrl)}
                       target="_blank"
-                      rel="noreferrer"
+                      rel="noopener noreferrer"
                       className="inline-flex items-center gap-1 text-[#20C5D5] hover:underline shrink-0"
                     >
                       <span>Portal</span>
@@ -2637,11 +2638,11 @@ export const DemoWorkspace: React.FC<{ initialSection?: string }> = ({
 
                   <div className="pt-2 border-t border-[var(--border-subtle)] flex flex-wrap items-center justify-between gap-2 text-[11px] text-[var(--text-secondary)]">
                     <span>Canais: {c.channels} · Consultado em {c.consultedAt}</span>
-                    {c.sourceUrl && (
+                    {safeExternalHref(c.sourceUrl) && (
                       <a
-                        href={c.sourceUrl}
+                        href={safeExternalHref(c.sourceUrl)}
                         target="_blank"
-                        rel="noreferrer"
+                        rel="noopener noreferrer"
                         className="inline-flex items-center gap-1 text-[#20C5D5] hover:underline"
                       >
                         <span>Ver referência pública</span>

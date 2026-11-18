@@ -525,16 +525,27 @@ export interface ParsedFinancialWorkbookResult {
 }
 
 export function parseFinancialWorkbookBuffer(buffer: ArrayBuffer): ParsedFinancialWorkbookResult {
-  const wb = XLSX.read(buffer, { type: 'array' });
+  if (buffer.byteLength > 6 * 1024 * 1024) {
+    throw new Error('Planilha excede o limite de segurança de 6 MB.');
+  }
+  const wb = XLSX.read(buffer, { type: 'array', cellHTML: false });
   const sales: Array<Omit<FinancialSalesRow, 'id'>> = [];
   const costs: Array<Omit<FinancialCostRow, 'id'>> = [];
   const expenses: Array<Omit<FinancialExpenseRow, 'id'>> = [];
   const inventory: Array<Omit<InventoryControlRow, 'id'>> = [];
 
-  for (const sheetName of wb.SheetNames) {
+  for (const sheetName of wb.SheetNames.slice(0, 20)) {
     const normSheet = normalizeHeaderKey(sheetName);
     const sheet = wb.Sheets[sheetName];
-    const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '' });
+    const rawRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '' });
+    const rows = rawRows.slice(0, 5000).map((row) => {
+      const safe: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(row)) {
+        if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+        safe[k] = v;
+      }
+      return safe;
+    });
     if (rows.length === 0) continue;
 
     if (normSheet.includes('venda')) {
